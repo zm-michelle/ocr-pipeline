@@ -1,12 +1,16 @@
+"""Charset encoding and greedy CTC decoding shared by training and inference."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 
 import torch
 
-from config import CTC_BLANK_INDEX, DEFAULT_CHARSET
+from ocr.config import CTC_BLANK_INDEX, DEFAULT_CHARSET
 
 
+@lru_cache(maxsize=8)
 def build_charset_maps(charset: str = DEFAULT_CHARSET) -> tuple[dict[str, int], dict[int, str]]:
     char_to_idx = {ch: i + 1 for i, ch in enumerate(charset)}
     idx_to_char = {i + 1: ch for i, ch in enumerate(charset)}
@@ -23,13 +27,20 @@ def decode_indices(indices: Sequence[int], charset: str = DEFAULT_CHARSET) -> st
     return "".join(idx_to_char[i] for i in indices if i != CTC_BLANK_INDEX and i in idx_to_char)
 
 
-def decode_ctc_greedy(logits: torch.Tensor, charset: str = DEFAULT_CHARSET) -> list[str]:
-    """Greedy CTC decode. No lexicon, spell correction, or language model."""
+def decode_ctc_greedy(
+    logits: torch.Tensor,
+    charset: str = DEFAULT_CHARSET,
+    time_first: bool | None = None,
+) -> list[str]:
+    """Greedy CTC decode. No lexicon, spell correction, or language model.
+
+    `time_first` says whether `logits` is [T, B, C] (True) or [B, T, C] (False).
+    Leave it as None to guess from the shape, which is safe whenever T > B.
+    """
     if logits.dim() != 3:
         raise ValueError("Expected logits shaped [T, B, C] or [B, T, C].")
 
-    if logits.shape[0] < logits.shape[1]:
-        # Most CRNN code returns [T, B, C], but accept [B, T, C] for convenience.
+    if time_first is False or (time_first is None and logits.shape[0] < logits.shape[1]):
         logits = logits.transpose(0, 1)
 
     best = logits.detach().argmax(dim=-1).cpu()

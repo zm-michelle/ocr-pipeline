@@ -9,8 +9,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from config import COMMON_FONT_DIRS, DEFAULT_PAGE_SIZE, FONT_FAMILIES, FONT_FILE_HINTS
-from transforms import (
+from ocr.config import COMMON_FONT_DIRS, DEFAULT_PAGE_SIZE, FONT_FAMILIES, FONT_FILE_HINTS
+from ocr.data.transforms import (
     add_gaussian_noise,
     add_salt_pepper,
     add_smudge,
@@ -18,7 +18,7 @@ from transforms import (
     add_uneven_illumination,
     mild_compression_artifacts,
 )
-from utils import ProgressLogger
+from ocr.utils import ProgressLogger
 
 
 OFFICE_WORDS = [
@@ -449,7 +449,10 @@ def generate_synthetic_dataset(
     seed: int | None = None,
     log_every: int = 100,
     render_profile: str = "noisyoffice",
+    val_split: float = 0.0,
 ) -> dict[str, Path]:
+    if not 0.0 <= val_split < 1.0:
+        raise ValueError("val_split must be in [0, 1)")
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
@@ -524,6 +527,28 @@ def generate_synthetic_dataset(
     meta_path = output_dir / "metadata.json"
     pages_manifest_path.write_text(json.dumps({"pages": page_manifest}, indent=2))
     lines_manifest_path.write_text(json.dumps({"samples": line_manifest}, indent=2))
+
+    outputs: dict[str, Path] = {
+        "pages_manifest": pages_manifest_path,
+        "lines_manifest": lines_manifest_path,
+    }
+    num_val_pages = int(round(num_samples * val_split)) if val_split else 0
+    if num_val_pages:
+        # Split by page, not by crop: every line crop of a validation page goes to
+        # validation with it, so the recognizer never trains on text it is scored on.
+        # Pages are generated i.i.d., so the tail is as random as any other slice.
+        val_pages = {p["image"] for p in page_manifest[-num_val_pages:]}
+        splits = {
+            "pages_manifest_train": ("pages", [p for p in page_manifest if p["image"] not in val_pages]),
+            "pages_manifest_val": ("pages", [p for p in page_manifest if p["image"] in val_pages]),
+            "lines_manifest_train": ("samples", [l for l in line_manifest if l["source_page"] not in val_pages]),
+            "lines_manifest_val": ("samples", [l for l in line_manifest if l["source_page"] in val_pages]),
+        }
+        for name, (key, items) in splits.items():
+            path = output_dir / f"{name}.json"
+            path.write_text(json.dumps({key: items}, indent=2))
+            outputs[name] = path
+
     meta_path.write_text(
         json.dumps(
             {
@@ -534,13 +559,12 @@ def generate_synthetic_dataset(
                 "max_lines": max_lines,
                 "render_profile": render_profile,
                 "degradation": asdict(degradation),
+                "val_split": val_split,
+                "num_val_pages": num_val_pages,
             },
             indent=2,
         )
     )
-    return {
-        "pages_manifest": pages_manifest_path,
-        "lines_manifest": lines_manifest_path,
-        "metadata": meta_path,
-        "previews": previews_dir,
-    }
+    outputs["metadata"] = meta_path
+    outputs["previews"] = previews_dir
+    return outputs

@@ -1,0 +1,13 @@
+# What `sky launch` does NOT sync up as the working directory. Data is generated
+# on the GPU box; checkpoints and runs come back down with rsync afterwards.
+.git/
+__pycache__/
+*.py[cod]
+.DS_Store
+data/
+outputs/
+checkpoints/
+runs/
+myenv/
+.venv/
+venv/

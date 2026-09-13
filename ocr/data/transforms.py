@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageEnhance, ImageFilter
 
-from config import DEFAULT_RECOGNIZER_HEIGHT, DEFAULT_RECOGNIZER_WIDTH
+from ocr.config import DEFAULT_RECOGNIZER_HEIGHT, DEFAULT_RECOGNIZER_WIDTH
 
 
 def to_grayscale(image: Image.Image) -> Image.Image:

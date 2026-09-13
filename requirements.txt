@@ -9,5 +9,13 @@ opencv-python>=4.7.0
 # Numerical
 numpy>=1.23.0
 
+# Live training curves (python main.py --mode train_* ; tensorboard --logdir runs)
+tensorboard>=2.14.0
+
+# Web app (web/server.py)
+fastapi>=0.110.0
+uvicorn>=0.27.0
+python-multipart>=0.0.9
+
 # No spell correction, no language model — intentionally omitted.
 # If you later add beam-search with an LM, add kenlm or pyctcdecode here.

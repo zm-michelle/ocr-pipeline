@@ -9,9 +9,9 @@ import torch
 from PIL import Image, ImageDraw
 from torch.utils.data import Dataset
 
-from config import DEFAULT_CHARSET, DEFAULT_DETECTOR_SIZE, IMAGE_EXTENSIONS
-from decode import encode_text
-from transforms import DetectionTransform, RecognitionTransform
+from ocr.config import DEFAULT_CHARSET, DEFAULT_DETECTOR_SIZE, IMAGE_EXTENSIONS
+from ocr.ctc import encode_text
+from ocr.data.transforms import DetectionTransform, RecognitionTransform
 
 
 def list_image_files(root: str | Path, extensions: tuple[str, ...] = IMAGE_EXTENSIONS) -> list[Path]:

@@ -1,7 +1,25 @@
-
-checkpoints
-__pycache__
+__pycache__/
+*.py[cod]
 .DS_Store
-myenv
-outputs_preview_noisyoffice_check
-outputs_ocr_folder_smoke
+
+# virtualenvs
+myenv/
+.venv/
+venv/
+
+# trained weights
+checkpoints/
+
+# OCR results, previews, and smoke-test artifacts
+outputs/
+
+# runs/ holds TensorBoard event files + metrics.jsonl per training run
+runs/
+
+# credentials — never commit these, wherever they end up
+.env
+.env.*
+config.toml
+.runpod/
+*.pem
+*.key

@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Document OCR</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔎</text></svg>">
+<style>
+  :root {
+    --bg: #f6f6f4;
+    --panel: #ffffff;
+    --ink: #1c1c1a;
+    --muted: #6f6f68;
+    --line: #e2e2dc;
+    --accent: #b8422c;
+    --accent-soft: #b8422c22;
+    --good: #3fa46a;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17171a;
+      --panel: #1f1f23;
+      --ink: #ececea;
+      --muted: #9a9a95;
+      --line: #32323a;
+      --accent: #e2765c;
+      --accent-soft: #e2765c22;
+      --good: #5fbf88;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 22px 28px 16px;
+    border-bottom: 1px solid var(--line);
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: baseline;
+  }
+  h1 { font-size: 19px; margin: 0; font-weight: 620; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  #status { margin-left: auto; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+  #status.ok .dot { background: var(--good); }
+  #status.bad .dot { background: var(--accent); }
+
+  main { padding: 22px 28px 40px; max-width: 1400px; margin: 0 auto; }
+
+  #drop {
+    border: 2px dashed var(--line);
+    border-radius: var(--radius);
+    background: var(--panel);
+    padding: 32px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  #drop:hover, #drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  #drop h2 { margin: 0 0 6px; font-size: 16px; font-weight: 560; }
+  #drop p { margin: 0; color: var(--muted); font-size: 13px; }
+
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 18px 26px; align-items: center;
+    margin: 16px 0 0; padding: 12px 16px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    font-size: 13.5px;
+  }
+  .controls label { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+  .controls input[type=range] { width: 130px; accent-color: var(--accent); }
+  .controls output { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 30px; }
+  .controls .hint { color: var(--muted); margin-left: auto; }
+
+  /* --- dataset browser --- */
+  #browser { margin-top: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+  #browser[hidden] { display: none; }
+  #browserBar {
+    display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center;
+    padding: 11px 16px; border-bottom: 1px solid var(--line); font-size: 13.5px;
+  }
+  #browserBar .title { font-size: 12px; font-weight: 620; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
+  select, input[type=search] {
+    font: inherit; font-size: 13.5px; padding: 5px 9px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink); max-width: 100%;
+  }
+  select { max-width: 340px; }
+  input[type=search] { width: 190px; }
+  #pager { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  /* An id selector outranks the [hidden] default, so restate it. */
+  #pager[hidden] { display: none; }
+
+  #grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(126px, 1fr));
+    gap: 10px; padding: 14px 16px; max-height: 330px; overflow-y: auto;
+  }
+  .thumb {
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+    background: var(--bg); cursor: grab; transition: border-color .12s, transform .12s;
+  }
+  .thumb:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .thumb.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+  .thumb:active { cursor: grabbing; }
+  .thumb img { display: block; width: 100%; height: 82px; object-fit: contain; background: #ffffff0d; }
+  .thumb .cap {
+    display: block; padding: 5px 7px; font-size: 10.5px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-top: 1px solid var(--line);
+  }
+  #gridNote { padding: 14px 16px; color: var(--muted); font-size: 13px; }
+  #gridNote code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+
+  #related { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--line); align-items: center; }
+  #related[hidden] { display: none; }
+  #related .lbl { font-size: 12px; color: var(--muted); margin-right: 2px; }
+  .related-btn {
+    display: flex; align-items: center; gap: 7px; padding: 4px 9px 4px 4px;
+    border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
+    cursor: grab; font-size: 12.5px; color: var(--ink);
+  }
+  .related-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .related-btn img { width: 34px; height: 26px; object-fit: cover; border-radius: 4px; background: #ffffff0d; }
+  .related-btn b { font-weight: 620; }
+  .related-btn .dim { color: var(--muted); font-size: 11.5px; }
+
+  /* --- results --- */
+  #results { display: none; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 20px; margin-top: 20px; align-items: start; }
+  @media (max-width: 940px) { #results { grid-template-columns: 1fr; } }
+  #rightCol { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .card > h3 {
+    margin: 0; padding: 11px 16px; font-size: 12px; font-weight: 620;
+    text-transform: uppercase; letter-spacing: .07em; color: var(--muted);
+    border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px;
+  }
+  .card > h3 .meta { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; font-variant-numeric: tabular-nums; }
+
+  #stage { display: flex; justify-content: center; background: #00000008; }
+  /* min-width:0 lets the flex item shrink so a wide page scales down instead of clipping. */
+  #canvas { position: relative; line-height: 0; max-width: 100%; min-width: 0; }
+  #preview { display: block; max-width: 100%; max-height: 560px; width: auto; height: auto; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #overlay rect { fill: transparent; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; opacity: .75; cursor: pointer; }
+  #overlay rect.active { fill: var(--accent-soft); opacity: 1; stroke-width: 3; }
+
+  #lines { margin: 0; padding: 4px 0; max-height: 340px; overflow-y: auto; }
+  .line { display: grid; grid-template-columns: 34px 1fr; gap: 10px; padding: 7px 16px; border-bottom: 1px solid var(--line); }
+  .line:last-child { border-bottom: none; }
+  .line:hover, .line.active { background: var(--accent-soft); }
+  .line .n { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; padding-top: 2px; }
+  .line .t { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; font-size: 13px; word-break: break-word; }
+  .line .t:empty::after { content: "(nothing recognized)"; color: var(--muted); font-style: italic; }
+
+  #truthCard[hidden] { display: none; }
+  #truth {
+    margin: 0; padding: 12px 16px; max-height: 260px; overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 13px; white-space: pre-wrap; word-break: break-word;
+  }
+  .score { display: inline-flex; align-items: center; gap: 5px; }
+  .score b { font-weight: 620; color: var(--ink); }
+
+  .actions { padding: 10px 16px; border-top: 1px solid var(--line); display: flex; gap: 8px; }
+  button {
+    font: inherit; font-size: 13px; padding: 6px 13px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+
+  #message { margin-top: 16px; padding: 12px 16px; border-radius: var(--radius); font-size: 13.5px; display: none; }
+  #message.err { display: block; background: var(--accent-soft); border: 1px solid var(--accent); }
+  #message.busy { display: block; background: var(--panel); border: 1px solid var(--line); color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Document OCR</h1>
+  <span class="sub">DBNet line detection &rarr; CRNN + CTC. Literal transcript, no spell correction.</span>
+  <span id="status"><span class="dot"></span>checking&hellip;</span>
+</header>
+
+<main>
+  <div id="drop" tabindex="0" role="button" aria-label="Choose or drop an image">
+    <h2>Drop an image here</h2>
+    <p>or click to choose, paste from the clipboard, or drag a sample from below</p>
+    <input id="file" type="file" accept=".png,.jpg,.jpeg,.tif,.tiff,image/*" hidden>
+  </div>
+
+  <div class="controls">
+    <label title="Uncheck when the image is already a single cropped line">
+      <input id="useDetector" type="checkbox" checked> Detect lines
+    </label>
+    <label title="Lower finds more text but adds noise">
+      Threshold
+      <input id="threshold" type="range" min="0.05" max="0.9" step="0.05" value="0.35">
+      <output id="thresholdOut">0.35</output>
+    </label>
+    <label title="Fall back to ink-projection line splitting when detection returns one blob">
+      <input id="splitLines" type="checkbox" checked> Split lines by projection
+    </label>
+    <span class="hint">Change a setting to re-run the current image.</span>
+  </div>
+
+  <section id="browser" hidden>
+    <div id="browserBar">
+      <span class="title">Dataset samples</span>
+      <select id="collection" aria-label="Sample collection"></select>
+      <input id="search" type="search" placeholder="Filter by filename" aria-label="Filter samples by filename">
+      <span id="pager">
+        <button id="prev" type="button">&lsaquo; Prev</button>
+        <span id="range">&mdash;</span>
+        <button id="next" type="button">Next &rsaquo;</button>
+      </span>
+    </div>
+    <div id="grid"></div>
+    <div id="gridNote" hidden></div>
+  </section>
+
+  <div id="message"></div>
+
+  <section id="results">
+    <div class="card">
+      <h3>Page <span class="meta" id="pageMeta"></span></h3>
+      <div id="stage">
+        <div id="canvas">
+          <img id="preview" alt="Selected page">
+          <svg id="overlay" preserveAspectRatio="none"></svg>
+        </div>
+      </div>
+      <div id="related" hidden></div>
+    </div>
+
+    <div id="rightCol">
+      <div class="card">
+        <h3>Predicted text <span class="meta" id="textMeta"></span></h3>
+        <div id="lines"></div>
+        <div class="actions">
+          <button id="copy" type="button">Copy text</button>
+          <button id="download" type="button">Download .txt</button>
+        </div>
+      </div>
+
+      <div class="card" id="truthCard" hidden>
+        <h3>Expected text <span class="meta" id="truthMeta"></span></h3>
+        <pre id="truth"></pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const SAMPLE_MIME = "application/x-ocr-sample";
+const PAGE_SIZE = 48;
+
+const drop = $("drop"), fileInput = $("file"), message = $("message"), results = $("results");
+let lastResult = null;      // the response we are showing
+let lastRequest = null;     // how to re-run it when a control changes
+let browse = { dataset: "", offset: 0, total: 0, q: "" };
+let searchTimer = null;
+
+function say(kind, text) {
+  message.className = kind || "";
+  message.textContent = text || "";
+}
+
+/* ---------- health ---------- */
+
+async function checkHealth() {
+  const el = $("status");
+  try {
+    const h = await (await fetch("/api/health")).json();
+    if (h.ready) {
+      el.className = "ok";
+      el.innerHTML = `<span class="dot"></span>${h.has_detector ? "detector + recognizer" : "recognizer only"} on ${h.device}`;
+      if (!h.has_detector) { $("useDetector").checked = false; $("useDetector").disabled = true; }
+    } else {
+      el.className = "bad";
+      el.innerHTML = `<span class="dot"></span>models not loaded`;
+      say("err", h.error || "The server started without usable checkpoints.");
+    }
+    // Always load: with zero collections this renders the "why am I empty" note.
+    loadCollections();
+  } catch {
+    el.className = "bad";
+    el.innerHTML = `<span class="dot"></span>server unreachable`;
+  }
+}
+
+/* ---------- dataset browser ---------- */
+
+async function loadCollections() {
+  const { collections } = await (await fetch("/api/samples/collections")).json();
+  $("browser").hidden = false;
+
+  if (!collections.length) {
+    // Say so out loud: a silently missing browser looks like a broken feature.
+    $("browserBar").querySelectorAll("select, input, #pager").forEach(el => el.hidden = true);
+    $("gridNote").hidden = false;
+    $("gridNote").innerHTML =
+      "No sample collections found. Start the server from the project root, " +
+      "or point it at your images with <code>--samples_dir &lt;path&gt;</code>. " +
+      "You can still drop or paste an image above.";
+    return;
+  }
+
+  const select = $("collection");
+  select.innerHTML = "";
+  for (const c of collections) {
+    const opt = document.createElement("option");
+    opt.value = c.key;
+    opt.textContent = `${c.label} — ${c.count} image${c.count === 1 ? "" : "s"}${c.has_ground_truth ? " ✓ ground truth" : ""}`;
+    select.appendChild(opt);
+  }
+  browse.dataset = collections[0].key;
+  loadPage(0);
+}
+
+async function loadPage(offset) {
+  const grid = $("grid"), note = $("gridNote");
+  const params = new URLSearchParams({ dataset: browse.dataset, offset, limit: PAGE_SIZE, q: browse.q });
+  grid.innerHTML = "";
+  note.hidden = false;
+  note.textContent = "Loading…";
+
+  let data;
+  try {
+    const r = await fetch(`/api/samples?${params}`);
+    data = await r.json();
+    if (!r.ok) throw new Error(data.detail || `status ${r.status}`);
+  } catch (e) {
+    note.textContent = `Could not list samples: ${e.message}`;
+    return;
+  }
+
+  browse.offset = data.offset;
+  browse.total = data.total;
+
+  if (!data.items.length) {
+    note.textContent = browse.q ? `No filenames match “${browse.q}”.` : "This collection is empty.";
+  } else {
+    note.hidden = true;
+    for (const item of data.items) grid.appendChild(makeThumb(item.name));
+  }
+  updatePager();
+  markActiveThumb();
+}
+
+function makeThumb(name) {
+  const cell = document.createElement("div");
+  cell.className = "thumb";
+  cell.draggable = true;
+  cell.dataset.name = name;
+  cell.title = `${name}\nClick to read, or drag onto the drop zone`;
+
+  const img = document.createElement("img");
+  img.loading = "lazy";
+  img.alt = name;
+  img.src = `/api/samples/thumb?dataset=${encodeURIComponent(browse.dataset)}&path=${encodeURIComponent(name)}`;
+
+  const cap = document.createElement("span");
+  cap.className = "cap";
+  cap.textContent = name;
+
+  cell.append(img, cap);
+  cell.addEventListener("click", () => runSample(browse.dataset, name));
+  cell.addEventListener("dragstart", (e) => {
+    const payload = JSON.stringify({ dataset: browse.dataset, path: name });
+    e.dataTransfer.setData(SAMPLE_MIME, payload);
+    e.dataTransfer.setData("text/plain", `${browse.dataset}/${name}`);
+    e.dataTransfer.effectAllowed = "copy";
+  });
+  return cell;
+}
+
+function updatePager() {
+  const from = browse.total ? browse.offset + 1 : 0;
+  const to = Math.min(browse.offset + PAGE_SIZE, browse.total);
+  $("range").textContent = `${from}–${to} of ${browse.total}`;
+  $("prev").disabled = browse.offset <= 0;
+  $("next").disabled = to >= browse.total;
+}
+
+function markActiveThumb() {
+  const current = lastRequest?.dataset === browse.dataset ? lastRequest.path : null;
+  for (const cell of document.querySelectorAll(".thumb")) {
+    cell.classList.toggle("active", cell.dataset.name === current);
+  }
+}
+
+$("collection").addEventListener("change", (e) => {
+  browse.dataset = e.target.value;
+  loadPage(0);
+});
+$("search").addEventListener("input", (e) => {
+  clearTimeout(searchTimer);
+  browse.q = e.target.value.trim();
+  searchTimer = setTimeout(() => loadPage(0), 220);
+});
+$("prev").addEventListener("click", () => loadPage(Math.max(0, browse.offset - PAGE_SIZE)));
+$("next").addEventListener("click", () => loadPage(browse.offset + PAGE_SIZE));
+
+/* ---------- running OCR ---------- */
+
+function settings() {
+  const body = new FormData();
+  body.append("use_detector", $("useDetector").checked);
+  body.append("threshold", $("threshold").value);
+  body.append("split_lines", $("splitLines").checked);
+  return body;
+}
+
+async function post(body, label) {
+  say("busy", `Reading ${label}…`);
+  try {
+    const r = await fetch("/api/ocr", { method: "POST", body });
+    const data = await r.json();
+    if (!r.ok) { say("err", data.detail || `Request failed (${r.status})`); return; }
+    say("", "");
+    render(data);
+  } catch (e) {
+    say("err", `Could not reach the server: ${e.message}`);
+  }
+}
+
+function runFile(file) {
+  if (!file) return;
+  lastRequest = { file };
+  const body = settings();
+  body.append("file", file);
+  markActiveThumb();
+  post(body, file.name);
+}
+
+function runSample(dataset, path) {
+  lastRequest = { dataset, path };
+  const body = settings();
+  body.append("dataset", dataset);
+  body.append("path", path);
+  markActiveThumb();
+  post(body, path);
+}
+
+function rerun() {
+  if (!lastRequest) return;
+  if (lastRequest.file) runFile(lastRequest.file);
+  else runSample(lastRequest.dataset, lastRequest.path);
+}
+
+/* ---------- rendering ---------- */
+
+function render(data) {
+  lastResult = data;
+  results.style.display = "grid";
+
+  $("preview").src = data.image;
+  $("pageMeta").textContent = `${data.source} · ${data.width}×${data.height}px`;
+
+  const overlay = $("overlay");
+  overlay.setAttribute("viewBox", `0 0 ${data.width} ${data.height}`);
+  overlay.innerHTML = "";
+
+  const list = $("lines");
+  list.innerHTML = "";
+
+  data.lines.forEach((line, i) => {
+    const [x1, y1, x2, y2] = line.box;
+    const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    rect.setAttribute("x", x1); rect.setAttribute("y", y1);
+    rect.setAttribute("width", Math.max(1, x2 - x1));
+    rect.setAttribute("height", Math.max(1, y2 - y1));
+    overlay.appendChild(rect);
+
+    const row = document.createElement("div");
+    row.className = "line";
+    const n = document.createElement("span"); n.className = "n"; n.textContent = i + 1;
+    const t = document.createElement("span"); t.className = "t"; t.textContent = line.text;
+    row.append(n, t);
+    list.appendChild(row);
+
+    const on = () => { rect.classList.add("active"); row.classList.add("active"); };
+    const off = () => { rect.classList.remove("active"); row.classList.remove("active"); };
+    row.addEventListener("mouseenter", on); row.addEventListener("mouseleave", off);
+    rect.addEventListener("mouseenter", on); rect.addEventListener("mouseleave", off);
+  });
+
+  const bits = [`${data.lines.length} line${data.lines.length === 1 ? "" : "s"}`, `${data.elapsed_ms} ms`];
+  if (!data.used_detector) bits.push("detector off");
+  else if (data.used_line_split_fallback) bits.push("projection fallback");
+
+  renderRelated(data.related || []);
+
+  const truthCard = $("truthCard");
+  if (data.ground_truth != null) {
+    truthCard.hidden = false;
+    $("truth").textContent = data.ground_truth;
+    const scores =
+      `<span class="score">CER <b>${(data.cer * 100).toFixed(1)}%</b></span> · ` +
+      `<span class="score">WER <b>${(data.wer * 100).toFixed(1)}%</b></span>`;
+    $("truthMeta").innerHTML = scores;
+    // Repeat the scores up top: the expected-text card often sits below the fold.
+    $("textMeta").innerHTML = `${bits.join(" · ")} · ${scores}`;
+  } else {
+    truthCard.hidden = true;
+    $("textMeta").textContent = bits.join(" · ");
+  }
+}
+
+// Other versions of the same page (NoisyOffice pairs each noisy scan with its clean
+// originals), so you can flip between them and watch what the degradation costs.
+function renderRelated(items) {
+  const bar = $("related");
+  bar.innerHTML = "";
+  if (!items.length) { bar.hidden = true; return; }
+
+  const label = document.createElement("span");
+  label.className = "lbl";
+  label.textContent = "Same page:";
+  bar.appendChild(label);
+
+  for (const item of items) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "related-btn";
+    btn.draggable = true;
+    btn.title = `${item.dataset}/${item.name}`;
+
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = "";
+    img.src = `/api/samples/thumb?dataset=${encodeURIComponent(item.dataset)}&path=${encodeURIComponent(item.name)}`;
+
+    const text = document.createElement("span");
+    text.innerHTML = item.version
+      ? `<b>${item.version}</b> <span class="dim">${item.label}</span>`
+      : item.label;
+
+    btn.append(img, text);
+    btn.addEventListener("click", () => runSample(item.dataset, item.name));
+    btn.addEventListener("dragstart", (e) => {
+      e.dataTransfer.setData(SAMPLE_MIME, JSON.stringify({ dataset: item.dataset, path: item.name }));
+      e.dataTransfer.setData("text/plain", `${item.dataset}/${item.name}`);
+      e.dataTransfer.effectAllowed = "copy";
+    });
+    bar.appendChild(btn);
+  }
+  bar.hidden = false;
+}
+
+/* ---------- input wiring ---------- */
+
+drop.addEventListener("click", () => fileInput.click());
+drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); } });
+fileInput.addEventListener("change", () => runFile(fileInput.files[0]));
+
+function handleDrop(e) {
+  const sample = e.dataTransfer.getData(SAMPLE_MIME);
+  if (sample) {
+    const { dataset, path } = JSON.parse(sample);
+    runSample(dataset, path);
+    return;
+  }
+  runFile(e.dataTransfer.files[0]);
+}
+
+["dragenter", "dragover"].forEach(ev =>
+  drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach(ev =>
+  drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", handleDrop);
+
+// Dropping anywhere on the page works too, but don't hijack normal navigation.
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => {
+  e.preventDefault();
+  if (e.target.closest("#drop") || e.target.closest("#browser")) return;
+  handleDrop(e);
+});
+
+document.addEventListener("paste", (e) => {
+  const item = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith("image/"));
+  if (item) runFile(item.getAsFile());
+});
+
+$("threshold").addEventListener("input", (e) => { $("thresholdOut").value = e.target.value; });
+$("threshold").addEventListener("change", rerun);
+$("useDetector").addEventListener("change", rerun);
+$("splitLines").addEventListener("change", rerun);
+
+$("copy").addEventListener("click", async () => {
+  if (!lastResult) return;
+  await navigator.clipboard.writeText(lastResult.text);
+  const b = $("copy"); b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy text"), 1200);
+});
+
+$("download").addEventListener("click", () => {
+  if (!lastResult) return;
+  const blob = new Blob([lastResult.text], { type: "text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (lastResult.filename || "ocr").replace(/\.[^.]+$/, "") + ".txt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+checkHealth();
+</script>
+</body>
+</html>

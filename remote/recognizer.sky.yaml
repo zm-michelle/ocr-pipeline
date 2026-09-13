@@ -1,0 +1,34 @@
+# Train the CRNN line recognizer on a RunPod RTX 4090.
+#
+#   sky launch -c ocr remote/recognizer.sky.yaml
+#   ssh -L 6006:localhost:6006 ocr        # then: tensorboard --logdir runs  (on the box)
+#   rsync -avz ocr:~/sky_workdir/checkpoints/ ./checkpoints/
+#   sky down ocr
+#
+# The resources/setup block is duplicated in detector.sky.yaml on purpose.
+
+resources:
+  cloud: runpod
+  accelerators: RTX4090:1
+  disk_size: 50
+
+workdir: .
+
+setup: |
+  set -e
+  apt-get update -qq && apt-get install -y -qq fonts-dejavu fonts-liberation
+  pip install -q -r requirements.txt
+  if [ ! -f data/synthetic_docs/lines_manifest_train.json ]; then
+    python main.py --mode generate_synth_data \
+      --output_dir data/synthetic_docs --num_samples 20000 --val_split 0.05 --preview_count 12
+  fi
+
+run: |
+  python main.py --mode train_recognizer \
+    --line_manifest      data/synthetic_docs/lines_manifest_train.json \
+    --val_line_manifest  data/synthetic_docs/lines_manifest_val.json \
+    --data_root          data/synthetic_docs \
+    --output_dir         checkpoints \
+    --run_name           recognizer \
+    --device cuda --amp --pin_memory --num_workers 6 \
+    --batch_size 64 --epochs 30 --lr 3e-4 --augment --log_every 50
