@@ -23,3 +23,4 @@ config.toml
 .runpod/
 *.pem
 *.key
+data/synthetic_docs/
