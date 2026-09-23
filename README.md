@@ -1,44 +1,54 @@
 # Degraded Printed Document OCR
 
-Reads text out of scanned printed pages that are in poor condition: coffee
-stains, folds, wrinkles, faded ink, low contrast.
+Optical character recognition for scanned printed documents in poor condition
+(stains, folds, wrinkles, faded ink, low contrast). Two PyTorch models are
+trained on synthetic pages and fine-tuned on real scans. Output is literal: no
+spell checking, lexicon, or language model is applied at any stage.
 
-Two small PyTorch models do the work.
-
-```
-full page  ->  DBNet-style detector finds the text lines
-           ->  each line cropped out
-           ->  CRNN + CTC recognizer reads each crop
-           ->  plain text
-```
-
-Output is literal. There is no spell checker, dictionary, or language model
-anywhere in the pipeline, so a half-visible word comes out half-visible rather
-than guessed at.
-
-## Where it stands
-
-On 72 held-out real scans from the SimulatedNoisyOffice corpus:
+## Architecture
 
 ```
-system                         CER       WER    s/page
-v3 fine-tuned (current)      4.00%    10.74%     0.29s
-v3 synthetic-only            5.29%    16.36%     0.28s
-tesseract 5.5.3              7.66%    17.60%     0.35s
-v1 first cluster run        30.64%    63.80%     0.20s
-original (pre-session)      54.56%    81.59%     0.15s
+page image -> detector -> line boxes -> crops -> recognizer -> text
 ```
 
-CER is character error rate, lower is better. Reproduce this table yourself
-with `--mode compare`, described under "Measuring how good it is" below.
+| Stage | Model | Input | Output |
+| --- | --- | --- | --- |
+| Detection | DBNet-style segmentation, 0.5M parameters | 540x258 grayscale page | text probability and threshold maps |
+| Recognition | CRNN + BiLSTM + CTC, 7.6M parameters | 32x1280 grayscale line crop | character sequence over a 95-character set |
 
-One caveat worth carrying: those labels come from running Tesseract on the
-clean version of each page, not from a human. So 4% means "4% different from
-what Tesseract read on the clean scan", which is a good proxy but not truth.
+The detector is trained with the differentiable binarization objective (Liao et
+al., AAAI 2020): targets are shrunk boxes, a second head predicts a per-pixel
+threshold, and the loss combines balanced cross-entropy, Dice, and an L1 term
+on the threshold map. Detected boxes are expanded back to line size using the
+predicted threshold map. `--detector_loss bce` selects the simpler per-pixel
+objective instead.
 
-## Setting up
+Line boxes are sorted into reading order; tall regions are split by horizontal
+ink projection as a fallback.
 
-Needs Python 3.12. Newer versions do not have PyTorch wheels yet.
+## Process
+
+1. **Data generation.** Synthetic pages are rendered from a 20,000-sentence
+   public-domain corpus with numbers, dates, codes, and symbols inserted, using
+   a randomly selected typeface per page, then degraded (stains, rings, folds,
+   noise, fading). Manifests pair each line crop with its exact transcript.
+2. **Training.** Detector and recognizer are trained independently on the
+   generated data with a cosine learning rate schedule.
+3. **Pseudo-labelling.** Real scans without transcripts are labelled by running
+   Tesseract on their pixel-aligned clean counterparts and transferring the
+   result to the degraded versions.
+4. **Fine-tuning.** Both models are fine-tuned on the real labelled pages mixed
+   with a sample of synthetic data.
+5. **Evaluation.** The full pipeline is scored end to end on held-out pages
+   using corpus character and word error rate, and compared against Tesseract.
+
+## Requirements
+
+- Python 3.12 (later versions lack PyTorch wheels)
+- Dependencies in `requirements.txt`: PyTorch, torchvision, OpenCV (headless),
+  Pillow, NumPy, FastAPI, Uvicorn, TensorBoard
+- Optional: `tesseract` for baseline comparison and pseudo-labelling;
+  `skypilot[runpod]` for cloud training
 
 ```bash
 python3.12 -m venv .venv
@@ -46,137 +56,58 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Every command below assumes that venv is active. Runs on CPU; add
-`--device cuda` (or `--device mps` on a Mac) when you have a GPU.
+All commands below assume the virtual environment is active. Execution defaults
+to CPU; pass `--device cuda` or `--device mps` for GPU.
 
-Some optional extras:
+## Usage
 
-- `brew install tesseract` (or `apt install tesseract-ocr`) for the baseline
-  comparison and for labelling real scans.
-- `pip install "skypilot[runpod]"` only if you want to train on rented GPUs.
-
-## Reading some pages
-
-The quickest way to see what it does is the web app:
+### Web application
 
 ```bash
 python -m web.server
 ```
 
-Open <http://127.0.0.1:8000>. Drag an image onto the page, click to browse for
-one, or paste one from the clipboard. You get the detected line boxes drawn
-over your image, the text beside it, and hovering either side highlights the
-matching line.
+Serves an interface at <http://127.0.0.1:8000> for reading uploaded, pasted, or
+browsed images. Displays detected line boxes over the image alongside the
+recognized text, and reports character and word error rate where transcripts
+are available. The loaded checkpoint paths are shown in the page header.
 
-The header tells you exactly which checkpoint files are loaded, so you always
-know which model you are looking at. To try a different one, restart with
-`--detector_ckpt path/to/detector.pt` and `--recognizer_ckpt path/to/rec.pt`.
+Options: `--recognizer_ckpt`, `--detector_ckpt`, `--samples_dir`, `--no_samples`,
+`--no_detector`, `--device`, `--host`, `--port`.
 
-Three controls re-run the current image without reloading anything:
+### Command line
 
-- **Detect lines** - turn it off when your image is already a single cropped line.
-- **Learned threshold** - lets the detector use the cutoff it learned instead of
-  a fixed one. On by default for models trained with the DB objective. Leave it on.
-- **Threshold** - the fixed cutoff, used only when the learned one is off.
+All operations use `python main.py --mode <mode>`.
 
-Below the drop zone is a browser over every image folder under `data/`. Pick a
-collection, filter by filename, then click a thumbnail to read it or drag one
-onto the drop zone. Nothing uploads; the server opens the file directly. Where
-a dataset ships transcripts, the expected text and a live CER come back with
-the prediction, and those collections are marked in the dropdown.
+| Mode | Purpose |
+| --- | --- |
+| `generate_synth_data` | Render synthetic training pages and manifests |
+| `train_detector` | Train the line detector |
+| `train_recognizer` | Train the line recognizer |
+| `test_detector` | Score the detector against a manifest |
+| `test_recognizer` | Score the recognizer against a manifest |
+| `eval_e2e` | Score the full pipeline, with an error breakdown |
+| `compare` | Score the pipeline against Tesseract and other checkpoints |
+| `benchmark` | Score an existing `predictions.json` against labels |
+| `ocr_folder` | Transcribe a directory of images |
+| `pseudo_label` | Label real scans from clean counterparts |
+| `smoke_test` | Verify the installation |
 
-When a dataset has several versions of one page, they are linked. NoisyOffice
-pairs every degraded scan with clean originals, so a "Same page" strip appears
-under the image letting you flip between them. That is the fastest way to see
-how much of an error is the damage and how much is the model.
-
-### From the command line
-
-For a whole folder at once:
+**Transcribe a directory.**
 
 ```bash
 python main.py --mode ocr_folder \
   --input_dir  data/SimulatedNoisyOffice/simulated_noisy_images_grayscale \
   --output_dir outputs/ocr \
   --recognizer_ckpt checkpoints/recognizer_last.pt \
-  --detector_ckpt   checkpoints/detector_last.pt \
-  --save_visualizations
+  --detector_ckpt   checkpoints/detector_last.pt
 ```
 
-You get one `.txt` per image under `texts/`, a `predictions.json` with the line
-boxes, and with `--save_visualizations` an overlay image showing what was
-detected. Add `--skip_detector` if the inputs are already single cropped lines.
+Writes one text file per image, a `predictions.json` containing line boxes, and
+optional crops and overlays with `--save_crops` and `--save_visualizations`.
+Use `--skip_detector` when inputs are already single line crops.
 
-### From Python
-
-```python
-from PIL import Image
-from ocr import OCRPipeline
-
-pipeline = OCRPipeline.load(
-    recognizer_ckpt="checkpoints/recognizer_last.pt",
-    detector_ckpt="checkpoints/detector_last.pt",
-)
-result = pipeline.read_image(Image.open("page.png"))
-print(result.text)
-for line in result.lines:
-    print(line.box, line.text)
-```
-
-## Measuring how good it is
-
-Three commands, increasing in usefulness.
-
-**Against other systems.** This is the one to reach for. It runs everything
-over the same pages and prints a table:
-
-```bash
-python main.py --mode compare \
-  --detector_manifest data/noisyoffice_labels/pages_manifest_test.json \
-  --data_root data/noisyoffice_labels \
-  --recognizer_ckpt checkpoints/recognizer_last.pt \
-  --detector_ckpt   checkpoints/detector_last.pt \
-  --output_dir outputs/comparison
-```
-
-By default that scores your current checkpoints against Tesseract. Add older
-models to the same table with `--compare_model`, repeated as often as you like:
-
-```bash
-  --compare_model "v3 synthetic-only=checkpoints/v3/recognizer_last.pt:checkpoints/v3/detector_last.pt" \
-  --compare_model "v1=checkpoints/v1/recognizer_v1.pt:checkpoints/v1/detector_v1.pt"
-```
-
-Other flags: `--label` names your current model in the table, `--baselines ""`
-drops Tesseract, `--no_self` leaves your own model out, `--limit N` scores only
-the first N pages while you are iterating. Results land in
-`comparison.json` and `comparison.txt`.
-
-**End to end, with a breakdown.** Same scoring, one system, plus detail on
-where the errors are:
-
-```bash
-python main.py --mode eval_e2e \
-  --detector_manifest data/noisyoffice_labels/pages_manifest_test.json \
-  --data_root data/noisyoffice_labels \
-  --recognizer_ckpt checkpoints/recognizer_last.pt \
-  --detector_ckpt   checkpoints/detector_last.pt \
-  --output_dir outputs/e2e
-```
-
-Alongside the totals you get CER split by font, style and line length, the most
-common character confusions, how many lines the detector missed versus how many
-spurious boxes it invented, and the worst pages by name. That breakdown is what
-tells you whether to work on the detector or the recognizer next.
-
-**One component at a time.** `--mode test_recognizer` and `--mode test_detector`
-score a single model against a manifest. Useful for isolating a regression, but
-remember that both can improve while the pipeline gets worse, which is exactly
-why `compare` and `eval_e2e` exist.
-
-## Making training data
-
-There are no real labelled pages to train on, so the pipeline generates its own.
+**Generate training data.**
 
 ```bash
 python main.py --mode generate_synth_data \
@@ -184,28 +115,11 @@ python main.py --mode generate_synth_data \
   --num_samples 40000 --val_split 0.05 --workers 8
 ```
 
-This writes page images, line crops, and manifests pairing each crop with its
-exact text. `--val_split 0.05` holds out 5% for validation, split by page so no
-line from a validation page can leak into training. `--workers` renders in
-parallel; pages are seeded individually, so the output is identical no matter
-how many workers you use.
+`--val_split` holds out a fraction of pages for validation. Pages are seeded
+individually, so output is identical for any `--workers` value. On Linux, run
+`remote/fonts.sh` first to install typefaces without root privileges.
 
-Text comes from `ocr/data/corpus/english.txt`, about 20,000 sentences from
-public-domain novels, with numbers, dates, prices, reference codes, names and
-symbols mixed in so the recognizer sees every character it might meet.
-
-Each page picks a random typeface from whatever is installed. On a Mac it finds
-around 25; on a bare Linux box run `remote/fonts.sh` first to install DejaVu,
-Liberation and FreeFont without needing root. The generator prints what it
-found and refuses to run if it would fall back to a bitmap font.
-
-Pages get coffee stains, cup rings, folds, wrinkles, noise and fading. Some are
-two-column, some are slightly skewed. The aim is to look like the real scans,
-and getting that right mattered far more than anything else in this project.
-
-## Training
-
-Recognizer:
+**Train.**
 
 ```bash
 python main.py --mode train_recognizer \
@@ -213,11 +127,7 @@ python main.py --mode train_recognizer \
   --val_line_manifest data/synthetic_docs/lines_manifest_val.json \
   --data_root data/synthetic_docs --output_dir checkpoints \
   --epochs 14 --batch_size 64 --augment
-```
 
-Detector:
-
-```bash
 python main.py --mode train_detector \
   --detector_manifest     data/synthetic_docs/pages_manifest_train.json \
   --val_detector_manifest data/synthetic_docs/pages_manifest_val.json \
@@ -225,51 +135,11 @@ python main.py --mode train_detector \
   --epochs 16 --batch_size 16 --augment
 ```
 
-On a GPU add `--device cuda --amp --pin_memory --num_workers 6`. Both use a
-cosine learning rate schedule by default, warming up then decaying.
+Add `--device cuda --amp --pin_memory --num_workers 6` on a GPU. Metrics are
+written to `runs/<name>/` for TensorBoard (`tensorboard --logdir runs`) and to
+`metrics.jsonl`.
 
-Always pass a validation manifest. Without one you get training curves only,
-and none of the sample predictions or mask images that make a run readable.
-
-### A note on the detector objective
-
-By default the detector trains the DBNet way rather than on plain per-pixel
-loss. The problem with per-pixel loss is that a pixel in the small gap between
-two lines costs almost nothing to get wrong, so the model learns a blurry mask,
-the gaps fill in, and two lines merge into one box. The recognizer then gets a
-crop with two lines stacked in it and returns nonsense.
-
-The fix has three parts: shrink the target boxes so the gap between lines is
-wide and unambiguous, have the model predict its own per-pixel cutoff instead
-of using a fixed one, and score overlap of regions rather than counting pixels.
-`--detector_loss bce` goes back to the old behaviour if you want to compare.
-
-Validation reports three F1 scores. Pixel F1 will happily give a high score to
-a model that paints eight lines as one blob. Box F1 at IoU 0.5 will not, and
-`detector_only` box F1 shows what the network manages without a downstream
-line-splitting heuristic rescuing it. Watch the last two.
-
-## Watching training
-
-Every training run writes to `runs/<name>/`.
-
-```bash
-tensorboard --logdir runs
-```
-
-Open <http://localhost:6006>. You get loss and metric curves, and for the
-recognizer a table of sample predictions next to their targets, refreshed each
-epoch. That table is worth watching: CTC outputs nothing but blanks for the
-first few hundred steps, then fragments, then words, and the CER number looks
-identical through the first two of those.
-
-Each run also writes `metrics.jsonl` and `hparams.json` in plain text, so the
-numbers are readable without TensorBoard.
-
-## Using real scans
-
-NoisyOffice ships no transcripts, but every damaged page has a clean twin. This
-reads the clean ones with Tesseract and applies the result to the damaged ones:
+**Label real scans.**
 
 ```bash
 python main.py --mode pseudo_label \
@@ -278,13 +148,8 @@ python main.py --mode pseudo_label \
   --output_dir data/noisyoffice_labels
 ```
 
-That gives 216 labelled real pages, split by the dataset's own naming into 144
-for training and 72 for testing. The labels carry some noise where Tesseract
-misread something, so treat them as a good proxy rather than ground truth.
-
-Fine-tuning on them is what took the current model from 5.29% to 4.00%.
-Manifest arguments accept mixes, where `:8` repeats a file eight times and
-`:0.1` takes a random tenth of it:
+**Fine-tune.** Manifest arguments accept comma-separated mixes, where `:8`
+repeats a file and `:0.1` samples a random tenth.
 
 ```bash
 python main.py --mode train_recognizer \
@@ -295,80 +160,78 @@ python main.py --mode train_recognizer \
   --epochs 6 --lr 5e-5 --augment
 ```
 
-Repeating the small real set against a slice of the large synthetic one keeps
-the model from forgetting what it already knew.
-
-## Training somewhere else
-
-Full runs take a few hours, which is a lot on a laptop. Two paths are set up.
-
-**A Slurm cluster.** Copy `remote/hpc.env.example` to `remote/hpc.env` and fill
-in your host, username, partition and account. You need SSH key access to the
-login node first (`ssh-copy-id yourhost`). Then:
+**Evaluate.**
 
 ```bash
-remote/hpc.sh push      # copy the code over
-remote/hpc.sh setup     # build a venv and install fonts, once
-remote/hpc.sh submit    # queue the job
-remote/hpc.sh status    # is it running yet
-remote/hpc.sh logs      # follow the output
-remote/hpc.sh fetch     # bring checkpoints and runs back
+python main.py --mode compare \
+  --detector_manifest data/noisyoffice_labels/pages_manifest_test.json \
+  --data_root data/noisyoffice_labels \
+  --recognizer_ckpt checkpoints/recognizer_last.pt \
+  --detector_ckpt   checkpoints/detector_last.pt \
+  --output_dir outputs/comparison
 ```
 
-The job generates data, trains both models, evaluates them, fine-tunes on real
-pages if `REAL_DIR` is set, and evaluates again. Pick stages with
-`remote/hpc.sh submit detector,e2e`. Override sizes at submit time with
-`NUM_SAMPLES`, `DATA_DIR`, `EPOCHS_REC`, `EPOCHS_DET`, `EPOCHS_FT`.
+Scores the current checkpoints against Tesseract on identical pages. Additional
+models are added with `--compare_model "name=recognizer.pt:detector.pt"`,
+repeatable. `--mode eval_e2e` scores a single system and additionally reports
+error rate by font, style, and line length, common character confusions, and
+detector misses against spurious boxes.
 
-Put `DATA_DIR` on the cluster's large project filesystem, not your home
-directory. A 40,000-page dataset is about 380,000 files and home quotas are
-usually too small for it.
+### Remote training
 
-For TensorBoard on the cluster, tunnel it:
+A Slurm driver is provided. Copy `remote/hpc.env.example` to `remote/hpc.env`
+and set the host, user, partition, and account; SSH key access is required.
 
 ```bash
-ssh -L 6006:localhost:6006 yourhost -t 'cd ~/ocr_project && .venv/bin/tensorboard --logdir runs'
+remote/hpc.sh push | setup | submit | status | logs | fetch
 ```
 
-**Rented GPUs via SkyPilot.** `remote/recognizer.sky.yaml` and
-`remote/detector.sky.yaml` target a RunPod RTX 4090. Store your key with
-`runpod config`, then `sky launch -c ocr remote/recognizer.sky.yaml`. Remember
-`sky down ocr` afterwards, since pods bill while they exist.
+The job generates data, trains both models, evaluates, fine-tunes on real pages
+when `REAL_DIR` is set, and evaluates again. Stages are selectable
+(`remote/hpc.sh submit detector,e2e`). `DATA_DIR` should point at a project
+filesystem rather than a home directory, as a 40,000-page dataset contains
+approximately 380,000 files.
 
-## What is where
+SkyPilot configurations for RunPod are in `remote/recognizer.sky.yaml` and
+`remote/detector.sky.yaml`.
+
+## Results
+
+Corpus error rates on 72 held-out real scans from SimulatedNoisyOffice,
+reproducible with `--mode compare`:
+
+| System | CER | WER | s/page |
+| --- | --- | --- | --- |
+| Current model, fine-tuned | 4.00% | 10.74% | 0.29 |
+| Current model, synthetic training only | 5.29% | 16.36% | 0.28 |
+| Tesseract 5.5.3 | 7.66% | 17.60% | 0.35 |
+| First cluster run | 30.64% | 63.80% | 0.20 |
+| Initial model | 54.56% | 81.59% | 0.15 |
+
+Reference transcripts are produced by Tesseract on the clean counterpart of
+each page and are therefore an approximation rather than a human transcription.
+
+## Repository layout
 
 ```
-main.py                  command line entry point
+main.py                command line entry point
 ocr/
-  config.py              charset, image sizes, font lists
-  ctc.py                 text encoding and CTC decoding
-  cli.py                 every --mode lives here
-  models/                the detector and recognizer networks
-  data/                  datasets, transforms, synthetic generation,
-                         DBNet targets, dataset browsing, pseudo-labelling
-  inference/             detection postprocessing, recognition, OCRPipeline
-  training/              training loops, losses, checkpoints, TensorBoard
-  evaluation/            metrics, end-to-end scoring, error breakdown,
-                         comparison against other systems
-web/                     the browser app
-remote/                  cluster and cloud training
-tests/                   run with: python tests/test_synthetic_boxes.py
-checkpoints/             trained weights (not in git)
-data/                    datasets (not in git except the corpus)
-runs/                    TensorBoard logs (not in git)
-outputs/                 OCR results and reports (not in git)
+  config.py            character set, image sizes, typeface lists
+  ctc.py               character encoding and CTC decoding
+  cli.py               argument parsing and mode dispatch
+  models/              detector and recognizer definitions
+  data/                datasets, transforms, synthetic generation,
+                       detector targets, dataset catalogue, pseudo-labelling
+  inference/           detection postprocessing, recognition, OCRPipeline
+  training/            training loops, losses, checkpoints, metric logging
+  evaluation/          metrics, end-to-end scoring, error breakdown, comparison
+web/                   browser application
+remote/                cluster and cloud training
+tests/                 python tests/test_synthetic_boxes.py
+checkpoints/           model weights (untracked)
+data/                  datasets (untracked, except the text corpus)
+runs/                  training logs (untracked)
+outputs/               transcripts and reports (untracked)
 ```
 
-## Things that will trip you up
-
-- **Always look at an end-to-end number before believing a component number.**
-  The detector's pixel score and the recognizer's line score can both improve
-  while the actual output gets worse. This happened twice here.
-- **Synthetic accuracy is not real accuracy.** One change improved synthetic CER
-  by 43% and made real scans 29% worse. Test on real pages.
-- **Generation scales differently than you expect.** A bug that appears once in
-  6,000 pages will not show up in a 50-page trial run. `tests/` exists because
-  of one such bug that killed a 40,000-page run partway through.
-- On a cluster, cap BLAS threads (`OMP_NUM_THREADS`) or imports segfault on
-  high-core-count login nodes. `remote/hpc.sh` does this for you.
-- PNG is the main format. JPG, TIF and TIFF can be read too.
+Supported image formats: PNG (primary), JPG, JPEG, TIF, TIFF.
