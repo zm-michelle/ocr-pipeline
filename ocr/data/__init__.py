@@ -7,9 +7,11 @@ from ocr.data.datasets import (
     PrintedLineDataset,
     detection_collate,
     list_image_files,
+    load_manifest_spec,
     recognition_collate,
 )
 from ocr.data.synthetic import DegradationConfig, generate_synthetic_dataset
+from ocr.data.targets import build_db_targets, shrink_box, unclip_box
 from ocr.data.transforms import DetectionTransform, RecognitionTransform
 
 __all__ = [
@@ -22,8 +24,12 @@ __all__ = [
     "detection_collate",
     "recognition_collate",
     "list_image_files",
+    "load_manifest_spec",
     "DegradationConfig",
     "generate_synthetic_dataset",
+    "build_db_targets",
+    "shrink_box",
+    "unclip_box",
     "DetectionTransform",
     "RecognitionTransform",
 ]

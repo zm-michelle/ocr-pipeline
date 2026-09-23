@@ -16,7 +16,11 @@ from torch.utils.data import DataLoader
 
 from ocr.config import DEFAULT_CHARSET
 from ocr.ctc import decode_ctc_greedy
-from ocr.evaluation.metrics import compute_cer, compute_wer, exact_match_ratio
+from PIL import Image
+
+from ocr.evaluation.metrics import compute_cer, compute_wer, detection_counts, exact_match_ratio, prf_from_counts
+from ocr.inference.detection import boxes_from_prob_map
+from ocr.training.losses import DBLoss, bce_loss
 from ocr.training.tracking import RunTracker
 from ocr.utils import ProgressLogger
 
@@ -62,10 +66,16 @@ def _prediction_table(predictions: list[str], targets: list[str]) -> str:
     return "\n".join(rows)
 
 
-def _mask_triptych(images: torch.Tensor, masks: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
-    """[N,1,H,W] x3 -> [N,1,H,3W]: input | target | prediction, side by side."""
-    inputs = (images.float() * 0.5 + 0.5).clamp(0, 1)  # undo (x - 0.5) / 0.5
-    return torch.cat([inputs, masks.float(), probs.float()], dim=-1).cpu()
+def _to_pil(image: torch.Tensor) -> Image.Image:
+    """[1,H,W] normalized tensor -> grayscale PIL, for the projection-based line splitter."""
+    arr = ((image[0].float() * 0.5 + 0.5).clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+    return Image.fromarray(arr, mode="L")
+
+
+def _detector_panels(images: torch.Tensor, gt: torch.Tensor, probs: torch.Tensor, thresh: torch.Tensor) -> torch.Tensor:
+    """[N,1,H,W] x4 -> [N,1,H,4W]: input | target | probability | threshold, side by side."""
+    inputs = (images.float() * 0.5 + 0.5).clamp(0, 1)
+    return torch.cat([inputs, gt.float(), probs.float(), thresh.float()], dim=-1).cpu()
 
 
 def train_detector(
@@ -79,40 +89,58 @@ def train_detector(
     log_every: int = 50,
     tracker: RunTracker | None = None,
     global_step: int = 0,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    loss_name: str = "db",
 ) -> dict[str, float]:
+    """One epoch. loss_name: "db" (DBNet objective, default) or "bce" (the original)."""
     model.train()
+    db_loss = DBLoss()
     scaler = _grad_scaler(device, amp)
-    total_loss = 0.0
+    totals: dict[str, float] = {}
     progress = ProgressLogger(f"detector train epoch {epoch}", len(train_loader), log_every)
     optimizer.zero_grad(set_to_none=True)
 
     for step, batch in enumerate(train_loader, start=1):
         global_step += 1
         images = batch["image"].to(device, non_blocking=True)
-        masks = batch["mask"].to(device, non_blocking=True)
+        gt = batch["mask"].to(device, non_blocking=True)
         with _autocast(device, amp):
-            logits = model(images)
-            loss = F.binary_cross_entropy_with_logits(logits, masks) / grad_accum_steps
+            if loss_name == "db":
+                prob_logits, thresh_logits = model.forward_maps(images)
+                terms = db_loss(
+                    prob_logits, thresh_logits, gt,
+                    batch["thresh_map"].to(device, non_blocking=True),
+                    batch["thresh_mask"].to(device, non_blocking=True),
+                )
+            else:
+                prob_logits = model(images)
+                terms = bce_loss(prob_logits.float(), gt)
+            loss = terms["loss"] / grad_accum_steps
         scaler.scale(loss).backward()
         if step % grad_accum_steps == 0:
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-        total_loss += float(loss.detach()) * grad_accum_steps
+            if scheduler is not None:
+                scheduler.step()
+        for name, value in terms.items():
+            totals[name] = totals.get(name, 0.0) + float(value)
 
         if log_every and progress.should_log(step):
             with torch.no_grad():
-                preds = torch.sigmoid(logits.detach()) >= 0.5
-                truth = masks >= 0.5
+                preds = torch.sigmoid(prob_logits.detach()) >= 0.5
+                truth = gt >= 0.5
                 precision, recall, f1 = _prf(
                     float((preds & truth).sum()),
                     float((preds & ~truth).sum()),
                     float((~preds & truth).sum()),
                 )
-            progress.log(step, f"loss {total_loss / step:.4f} precision {precision:.3f} recall {recall:.3f} f1 {f1:.3f}")
+            means = {name: value / step for name, value in totals.items()}
+            extra = " ".join(f"{k[5:]} {v:.3f}" for k, v in means.items() if k != "loss")
+            progress.log(step, f"loss {means['loss']:.4f} [{extra}] precision {precision:.3f} recall {recall:.3f} f1 {f1:.3f}")
             if tracker:
                 tracker.scalars(
-                    {"loss": total_loss / step, "precision": precision, "recall": recall, "f1": f1, "lr": _lr(optimizer)},
+                    {**means, "precision": precision, "recall": recall, "f1": f1, "lr": _lr(optimizer)},
                     global_step,
                     prefix="train/",
                 )
@@ -121,8 +149,10 @@ def train_detector(
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        if scheduler is not None:
+            scheduler.step()
 
-    epoch_loss = total_loss / max(1, len(train_loader))
+    epoch_loss = totals.get("loss", 0.0) / max(1, len(train_loader))
     if tracker:
         tracker.scalar("epoch/train_loss", epoch_loss, epoch)
         tracker.flush()
@@ -138,44 +168,86 @@ def validate_detector(
     threshold: float = 0.5,
     tracker: RunTracker | None = None,
     step: int = 0,
+    unclip_ratio: float = 0.0,
+    box_threshold: float = 0.35,
 ) -> dict[str, float]:
+    """Pixel P/R/F1 against the target mask AND box-level P/R/F1 at IoU >= 0.5.
+
+    The box metric runs the real postprocessing (`boxes_from_prob_map`, the same
+    call inference makes) on each page and matches against the manifest boxes,
+    so it reflects whether lines come out separated - which pixel F1 cannot see.
+    `box_threshold` is the inference-time cutoff; `threshold` is for pixel PRF.
+    """
     model.eval()
     losses: list[float] = []
     pixel_tp = pixel_fp = pixel_fn = 0.0
+    box_tp = box_fp = box_fn = 0
+    raw_tp = raw_fp = raw_fn = 0  # detector alone, before the projection-split rescue
     progress = ProgressLogger("detector val", len(val_loader), log_every=20)
-    sample_grid: torch.Tensor | None = None
+    panels: torch.Tensor | None = None
 
     for batch_idx, batch in enumerate(val_loader, start=1):
         images = batch["image"].to(device, non_blocking=True)
-        masks = batch["mask"].to(device, non_blocking=True)
+        gt = batch["mask"].to(device, non_blocking=True)
         with _autocast(device, amp):
-            logits = model(images)
-            loss = F.binary_cross_entropy_with_logits(logits, masks)
-        probs = torch.sigmoid(logits.float())
+            prob_logits, thresh_logits = model.forward_maps(images)
+            loss = F.binary_cross_entropy_with_logits(prob_logits.float(), gt)
+        probs = torch.sigmoid(prob_logits.float())
         preds = probs >= threshold
-        truth = masks >= 0.5
+        truth = gt >= 0.5
         pixel_tp += float((preds & truth).sum())
         pixel_fp += float((preds & ~truth).sum())
         pixel_fn += float((~preds & truth).sum())
         losses.append(float(loss))
-        if sample_grid is None and tracker:
+
+        # Box-level: the postprocessing OCR will actually run, page by page.
+        # Score the path inference actually takes: for a DB detector that is the
+        # learned threshold (B = sigmoid(50 (P - T)) cut at 0.5) plus the T-ridge unclip.
+        thresh_probs = torch.sigmoid(thresh_logits.float())
+        if unclip_ratio > 0:
+            score_maps = torch.sigmoid(50.0 * (probs - thresh_probs))
+            cutoff = 0.5
+        else:
+            score_maps, cutoff = probs, box_threshold
+        for i in range(images.shape[0]):
+            pil, gt_boxes = _to_pil(images[i]), [tuple(b) for b in batch["boxes"][i]]
+            score_np = score_maps[i, 0].cpu().numpy()
+            t_np = thresh_probs[i, 0].cpu().numpy() if unclip_ratio > 0 else None
+            tp, fp, fn = detection_counts(boxes_from_prob_map(score_np, pil, cutoff, unclip_ratio, thresh_map=t_np), gt_boxes)
+            box_tp, box_fp, box_fn = box_tp + tp, box_fp + fp, box_fn + fn
+            tp, fp, fn = detection_counts(boxes_from_prob_map(score_np, pil, cutoff, unclip_ratio, split_lines=False, thresh_map=t_np), gt_boxes)
+            raw_tp, raw_fp, raw_fn = raw_tp + tp, raw_fp + fp, raw_fn + fn
+
+        if panels is None and tracker:
             k = min(SAMPLE_MASKS, images.shape[0])
-            sample_grid = _mask_triptych(images[:k], masks[:k], probs[:k])
+            panels = _detector_panels(images[:k], gt[:k], probs[:k], torch.sigmoid(thresh_logits[:k].float()))
         if progress.should_log(batch_idx):
             precision, recall, f1 = _prf(pixel_tp, pixel_fp, pixel_fn)
-            progress.log(batch_idx, f"loss {float(np.mean(losses)):.4f} precision {precision:.3f} recall {recall:.3f} f1 {f1:.3f}")
+            box = prf_from_counts(box_tp, box_fp, box_fn)
+            raw = prf_from_counts(raw_tp, raw_fp, raw_fn)
+            progress.log(
+                batch_idx,
+                f"loss {float(np.mean(losses)):.4f} pixel f1 {f1:.3f} | box f1 {box['f1']:.3f} "
+                f"(p {box['precision']:.3f} r {box['recall']:.3f}) | detector-only box f1 {raw['f1']:.3f}",
+            )
 
     precision, recall, f1 = _prf(pixel_tp, pixel_fp, pixel_fn)
+    box = prf_from_counts(box_tp, box_fp, box_fn)
+    raw = prf_from_counts(raw_tp, raw_fp, raw_fn)
     stats = {
         "loss": float(np.mean(losses)) if losses else 0.0,
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "box_precision": box["precision"],
+        "box_recall": box["recall"],
+        "box_f1": box["f1"],
+        "box_f1_detector_only": raw["f1"],
     }
     if tracker:
         tracker.scalars(stats, step, prefix="val/")
-        if sample_grid is not None:
-            tracker.image_grid("val/input_target_prediction", sample_grid, step)
+        if panels is not None:
+            tracker.image_grid("val/input_target_prob_thresh", panels, step)
         tracker.flush()
     return stats
 
@@ -191,6 +263,7 @@ def train_recognizer(
     log_every: int = 50,
     tracker: RunTracker | None = None,
     global_step: int = 0,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> dict[str, float]:
     model.train()
     ctc_loss = nn.CTCLoss(blank=0, zero_infinity=True)
@@ -219,6 +292,8 @@ def train_recognizer(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            if scheduler is not None:
+                scheduler.step()
         total_loss += float(loss.detach()) * grad_accum_steps
 
         if log_every and progress.should_log(step):
@@ -239,6 +314,8 @@ def train_recognizer(
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        if scheduler is not None:
+            scheduler.step()
 
     epoch_loss = total_loss / max(1, len(train_loader))
     if tracker:

@@ -2,8 +2,10 @@
 
 from ocr.inference.detection import (
     Box,
+    boxes_from_prob_map,
     detect_text_regions,
     merge_overlapping_boxes,
+    refine_boxes_with_threshold_map,
     sort_boxes_reading_order,
     split_regions_into_lines,
 )
@@ -20,8 +22,10 @@ from ocr.inference.recognition import recognize_crop, recognize_crops
 
 __all__ = [
     "Box",
+    "boxes_from_prob_map",
     "detect_text_regions",
     "merge_overlapping_boxes",
+    "refine_boxes_with_threshold_map",
     "sort_boxes_reading_order",
     "split_regions_into_lines",
     "recognize_crop",

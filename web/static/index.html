@@ -44,6 +44,10 @@
   h1 { font-size: 19px; margin: 0; font-weight: 620; letter-spacing: -0.01em; }
   .sub { color: var(--muted); font-size: 13px; }
   #status { margin-left: auto; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #models { width: 100%; font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 18px; margin-top: 2px; }
+  #models code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--ink); }
+  #models[hidden] { display: none; }
+  .controls label.off { opacity: .45; }
   #status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
   #status.ok .dot { background: var(--good); }
   #status.bad .dot { background: var(--accent); }
@@ -181,6 +185,7 @@
   <h1>Document OCR</h1>
   <span class="sub">DBNet line detection &rarr; CRNN + CTC. Literal transcript, no spell correction.</span>
   <span id="status"><span class="dot"></span>checking&hellip;</span>
+  <div id="models" hidden></div>
 </header>
 
 <main>
@@ -194,7 +199,10 @@
     <label title="Uncheck when the image is already a single cropped line">
       <input id="useDetector" type="checkbox" checked> Detect lines
     </label>
-    <label title="Lower finds more text but adds noise">
+    <label id="learnedWrap" title="Binarize with the threshold map the detector learned (DB loss) instead of a fixed cutoff" hidden>
+      <input id="learnedThreshold" type="checkbox"> Learned threshold
+    </label>
+    <label id="thresholdWrap" title="Fixed cutoff on the probability map. Ignored while the learned threshold is on.">
       Threshold
       <input id="threshold" type="range" min="0.05" max="0.9" step="0.05" value="0.35">
       <output id="thresholdOut">0.35</output>
@@ -278,6 +286,7 @@ async function checkHealth() {
       el.className = "ok";
       el.innerHTML = `<span class="dot"></span>${h.has_detector ? "detector + recognizer" : "recognizer only"} on ${h.device}`;
       if (!h.has_detector) { $("useDetector").checked = false; $("useDetector").disabled = true; }
+      showModels(h);
     } else {
       el.className = "bad";
       el.innerHTML = `<span class="dot"></span>models not loaded`;
@@ -289,6 +298,32 @@ async function checkHealth() {
     el.className = "bad";
     el.innerHTML = `<span class="dot"></span>server unreachable`;
   }
+}
+
+// Say exactly which files are loaded, so "which model is this?" never needs asking.
+function showModels(h) {
+  const m = $("models");
+  const info = h.detector_info || {};
+  const parts = [`recognizer <code>${h.recognizer || "—"}</code>`];
+  if (h.has_detector) {
+    const kind = info.loss === "db" ? `DB loss, epoch ${info.epoch}, learned threshold head` : `${info.loss || "?"}${info.epoch ? ", epoch " + info.epoch : ""}`;
+    parts.push(`detector <code>${h.detector}</code> — ${kind}`);
+  }
+  m.innerHTML = parts.join("");
+  m.hidden = false;
+
+  // The learned-threshold toggle only exists for detectors that have the head.
+  if (info.has_threshold_head) {
+    $("learnedWrap").hidden = false;
+    $("learnedThreshold").checked = !!h.learned_threshold_default;
+    syncThresholdEnabled();
+  }
+}
+
+function syncThresholdEnabled() {
+  const learned = !$("learnedWrap").hidden && $("learnedThreshold").checked;
+  $("threshold").disabled = learned;
+  $("thresholdWrap").classList.toggle("off", learned);
 }
 
 /* ---------- dataset browser ---------- */
@@ -411,6 +446,7 @@ function settings() {
   body.append("use_detector", $("useDetector").checked);
   body.append("threshold", $("threshold").value);
   body.append("split_lines", $("splitLines").checked);
+  if (!$("learnedWrap").hidden) body.append("learned_threshold", $("learnedThreshold").checked);
   return body;
 }
 
@@ -490,7 +526,10 @@ function render(data) {
 
   const bits = [`${data.lines.length} line${data.lines.length === 1 ? "" : "s"}`, `${data.elapsed_ms} ms`];
   if (!data.used_detector) bits.push("detector off");
-  else if (data.used_line_split_fallback) bits.push("projection fallback");
+  else {
+    bits.push(data.used_learned_threshold ? "learned threshold" : `fixed threshold ${$("threshold").value}`);
+    if (data.used_line_split_fallback) bits.push("projection fallback");
+  }
 
   renderRelated(data.related || []);
 
@@ -590,6 +629,7 @@ $("threshold").addEventListener("input", (e) => { $("thresholdOut").value = e.ta
 $("threshold").addEventListener("change", rerun);
 $("useDetector").addEventListener("change", rerun);
 $("splitLines").addEventListener("change", rerun);
+$("learnedThreshold").addEventListener("change", () => { syncThresholdEnabled(); rerun(); });
 
 $("copy").addEventListener("click", async () => {
   if (!lastResult) return;

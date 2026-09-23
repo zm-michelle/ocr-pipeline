@@ -23,6 +23,7 @@ from ocr.config import (
     DEFAULT_RECOGNIZER_HEIGHT,
     DEFAULT_RECOGNIZER_WIDTH,
     IMAGE_EXTENSIONS,
+    LEGACY_RECOGNIZER_SIZE,
 )
 from ocr.inference.detection import Box, detect_text_regions, split_regions_into_lines
 from ocr.inference.recognition import recognize_crops
@@ -92,6 +93,9 @@ class OCRPipeline:
         rec_height: int = DEFAULT_RECOGNIZER_HEIGHT,
         rec_width: int = DEFAULT_RECOGNIZER_WIDTH,
         split_lines_without_detector: bool = False,
+        unclip_ratio: float = 0.0,
+        learned_threshold: bool = False,
+        detector_info: dict[str, Any] | None = None,
     ) -> None:
         self.device = resolve_device(device)
         self.recognizer = recognizer.to(self.device).eval()
@@ -102,6 +106,12 @@ class OCRPipeline:
         self.rec_height = rec_height
         self.rec_width = rec_width
         self.split_lines_without_detector = split_lines_without_detector
+        # >0 when the detector was trained on shrunk targets (stored in its checkpoint)
+        self.unclip_ratio = unclip_ratio
+        # binarize with the detector's own threshold map instead of a fixed cutoff
+        self.learned_threshold = learned_threshold
+        # what the detector checkpoint recorded about itself, for display
+        self.detector_info = detector_info or {}
 
     @classmethod
     def load(
@@ -115,12 +125,34 @@ class OCRPipeline:
         """Build a pipeline from checkpoint files on disk."""
         device = resolve_device(device)
         recognizer = CRNNRecognizer(charset=charset).to(device)
-        load_checkpoint(recognizer_ckpt, recognizer, device=device, strict=False)
+        rec_ckpt = load_checkpoint(recognizer_ckpt, recognizer, device=device, strict=False)
+        # Feed the recognizer crops shaped the way it was trained; checkpoints from
+        # before this metadata existed were all trained at the legacy 32x512.
+        if "rec_height" in rec_ckpt:
+            kwargs.setdefault("rec_height", int(rec_ckpt["rec_height"]))
+            kwargs.setdefault("rec_width", int(rec_ckpt["rec_width"]))
+        else:
+            kwargs.setdefault("rec_height", LEGACY_RECOGNIZER_SIZE[0])
+            kwargs.setdefault("rec_width", LEGACY_RECOGNIZER_SIZE[1])
 
         detector = None
         if detector_ckpt:
             detector = DBNet().to(device)
-            load_checkpoint(detector_ckpt, detector, device=device, strict=False)
+            ckpt = load_checkpoint(detector_ckpt, detector, device=device, strict=False)
+            # A detector trained on shrunk targets records how to undo the shrink;
+            # older checkpoints carry nothing and get unclip_ratio 0 (no change).
+            kwargs.setdefault("unclip_ratio", float(ckpt.get("unclip_ratio", 0.0)))
+            # A DB-trained detector has a threshold head worth using; default to it.
+            is_db = ckpt.get("detector_loss") == "db"
+            kwargs.setdefault("learned_threshold", is_db)
+            kwargs.setdefault("detector_info", {
+                "path": str(detector_ckpt),
+                "loss": ckpt.get("detector_loss", "bce (pre-DB checkpoint)"),
+                "epoch": ckpt.get("epoch"),
+                "shrink_ratio": float(ckpt.get("shrink_ratio", 0.0)),
+                "unclip_ratio": float(ckpt.get("unclip_ratio", 0.0)),
+                "has_threshold_head": is_db,
+            })
 
         return cls(recognizer=recognizer, detector=detector, device=device, charset=charset, **kwargs)
 
@@ -134,6 +166,7 @@ class OCRPipeline:
         use_detector: bool = True,
         threshold: float | None = None,
         split_lines: bool | None = None,
+        learned_threshold: bool | None = None,
     ) -> tuple[list[Box], np.ndarray | None, bool]:
         min_w, min_h = MIN_SPLITTABLE_SIZE
         splittable = image.width >= min_w and image.height >= min_h
@@ -153,6 +186,8 @@ class OCRPipeline:
             device=self.device,
             image_size=self.detector_size,
             threshold=self.threshold if threshold is None else threshold,
+            unclip_ratio=self.unclip_ratio,
+            learned_threshold=self.learned_threshold if learned_threshold is None else learned_threshold,
         )
         boxes = split_regions_into_lines(image, boxes or whole_page)
         if len(boxes) <= 1 and splittable:
@@ -167,6 +202,7 @@ class OCRPipeline:
         use_detector: bool = True,
         threshold: float | None = None,
         split_lines: bool | None = None,
+        learned_threshold: bool | None = None,
     ) -> PageResult:
         """OCR a single in-memory image. Returns text plus per-line boxes.
 
@@ -174,7 +210,7 @@ class OCRPipeline:
         so a caller serving many requests can vary them without reloading models.
         """
         image = image.convert("L")
-        boxes, prob_map, fallback = self._line_boxes(image, use_detector, threshold, split_lines)
+        boxes, prob_map, fallback = self._line_boxes(image, use_detector, threshold, split_lines, learned_threshold)
         texts = recognize_crops(
             self.recognizer,
             [image.crop(box) for box in boxes],

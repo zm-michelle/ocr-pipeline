@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 
 from ocr.config import DEFAULT_DETECTOR_SIZE
+from ocr.data.targets import unclip_box
 from ocr.data.transforms import normalize_tensor, pil_to_tensor, resize_page
 
 Box = tuple[int, int, int, int]
@@ -157,6 +158,102 @@ def split_regions_into_lines(
     return sort_boxes_reading_order(filtered)
 
 
+def _ridge(profile: np.ndarray, start: int, direction: int, max_steps: int) -> int:
+    """Walk from `start` in `direction` (+1/-1) and return the index where `profile` peaks.
+
+    The threshold map is trained to be highest exactly on a box border and to
+    fall off on both sides, so its ridge marks the true edge of the line.
+    """
+    n = len(profile)
+    best_idx, best_val = start, -1.0
+    for step in range(max_steps + 1):
+        idx = start + direction * step
+        if idx < 0 or idx >= n:
+            break
+        value = float(profile[idx])
+        if value > best_val:
+            best_idx, best_val = idx, value
+        elif value < best_val - 0.02 and best_idx != start:
+            break  # past the first ridge; stop before we climb the neighbouring line's
+    return best_idx
+
+
+def refine_boxes_with_threshold_map(boxes: list[Box], thresh_map: np.ndarray, max_grow_factor: float = 2.5) -> list[Box]:
+    """Snap each detected core box to the ridges of the learned threshold map.
+
+    Used instead of the geometric unclip when the detector has a threshold
+    head: the geometric rule multiplies any blur in the core's thickness by
+    ~2.5x, which for 17 px lines turns a 5 px blur into a 13 px overshoot.
+    The threshold map peaks on the real border, so we read the border off it.
+    """
+    height, width = thresh_map.shape[:2]
+    refined: list[Box] = []
+    for x1, y1, x2, y2 in boxes:
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(width, x2), min(height, y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        core_h = y2 - y1
+        max_steps = int(max_grow_factor * core_h) + 4
+        rows = thresh_map[:, x1:x2].mean(axis=1)
+        top = _ridge(rows, y1, -1, max_steps)
+        bottom = _ridge(rows, max(y1, y2 - 1), +1, max_steps)
+        cols = thresh_map[top : bottom + 1, :].mean(axis=0)
+        grow_x = int(0.5 * ((y1 - top) + (bottom + 1 - y2))) + 2  # borders sit about as far out sideways
+        left = _ridge(cols, x1, -1, grow_x)
+        right = _ridge(cols, max(x1, x2 - 1), +1, grow_x)
+        refined.append((left, top, right + 1, bottom + 1))
+    return refined
+
+
+def boxes_from_prob_map(
+    prob: np.ndarray,
+    image: Image.Image,
+    threshold: float = 0.35,
+    unclip_ratio: float = 0.0,
+    min_area: int = 80,
+    padding: int = 4,
+    split_lines: bool = True,
+    thresh_map: np.ndarray | None = None,
+) -> list[Box]:
+    """Probability map (same size as `image`) -> reading-order line boxes.
+
+    This is the one postprocessing path, shared by inference and by detector
+    validation so the box-level metric scores exactly what OCR will get.
+    `unclip_ratio` re-expands boxes from a detector trained on shrunk targets.
+    `split_lines=False` skips the ink-projection rescue of tall regions, which
+    validation uses to score the detector's own separation of lines.
+    """
+    height, width = prob.shape[:2]
+    mask = (prob >= threshold).astype(np.uint8) * 255
+    kernel_w = max(9, width // 80)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    cores: list[Box] = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w * h < min_area or h < 5 or w < 8:
+            continue
+        cores.append((x, y, x + w, y + h))
+
+    if thresh_map is not None and unclip_ratio > 0:
+        # Learned border: snap to the threshold-map ridge, then a light pad.
+        grown = refine_boxes_with_threshold_map(cores, thresh_map)
+        pad = max(1, padding // 2)
+    else:
+        grown = [unclip_box(b, unclip_ratio, width, height) if unclip_ratio > 0 else b for b in cores]
+        pad = padding
+    boxes: list[Box] = [
+        (max(0, x1 - pad), max(0, y1 - pad), min(width, x2 + pad), min(height, y2 + pad)) for x1, y1, x2, y2 in grown
+    ]
+    merged = merge_overlapping_boxes(boxes)
+    if not split_lines:
+        return sort_boxes_reading_order(merged)
+    return split_regions_into_lines(image, merged)
+
+
 def detect_text_regions(
     detector: torch.nn.Module,
     image: Image.Image,
@@ -165,33 +262,44 @@ def detect_text_regions(
     threshold: float = 0.35,
     min_area: int = 80,
     padding: int = 4,
+    unclip_ratio: float = 0.0,
+    learned_threshold: bool = False,
+    db_k: float = 50.0,
 ) -> tuple[list[Box], np.ndarray]:
-    """Run the detector and return reading-order line boxes plus the probability map."""
+    """Run the detector and return reading-order line boxes plus the map that was binarized.
+
+    learned_threshold=False: cut the probability map P at the fixed `threshold`.
+    learned_threshold=True:  use the detector's own threshold map T, i.e. keep
+        pixels where P > T - the binarization the DB loss trained for. The
+        returned map is then B = sigmoid(k (P - T)), cut at 0.5, and `threshold`
+        is ignored. Only meaningful for a detector trained with the DB loss.
+    """
     original = image.convert("L")
     original_w, original_h = original.size
-    model_input = resize_page(original, image_size)
+    # Match the training width and let the height follow (rounded to the stride),
+    # instead of squashing every page into 540x258: a 540x420 scan keeps its
+    # ~20 px lines, which is the text size the detector was trained on. DBNet is
+    # fully convolutional, so any height works at inference.
+    target_w = image_size[0]
+    target_h = max(32, int(round(original_h * target_w / original_w / 32)) * 32)
+    model_input = resize_page(original, (target_w, target_h))
     tensor = normalize_tensor(pil_to_tensor(model_input)).unsqueeze(0).to(device)
 
     detector.eval()
     with torch.no_grad():
-        prob = torch.sigmoid(detector(tensor))[0, 0].detach().cpu().numpy()
+        if learned_threshold and hasattr(detector, "forward_maps"):
+            prob_logits, thresh_logits = detector.forward_maps(tensor)
+            prob = torch.sigmoid(prob_logits.float())
+            thresh = torch.sigmoid(thresh_logits.float())
+            binary = torch.sigmoid(db_k * (prob - thresh))
+            score_map = binary[0, 0].cpu().numpy()
+            thresh_np = cv2.resize(thresh[0, 0].cpu().numpy(), (original_w, original_h), interpolation=cv2.INTER_LINEAR)
+            cutoff = 0.5
+        else:
+            score_map = torch.sigmoid(detector(tensor))[0, 0].detach().cpu().numpy()
+            thresh_np = None
+            cutoff = threshold
 
-    prob = cv2.resize(prob, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
-    mask = (prob >= threshold).astype(np.uint8) * 255
-    kernel_w = max(9, original_w // 80)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    boxes: list[Box] = []
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        if w * h < min_area or h < 5 or w < 8:
-            continue
-        x1 = max(0, x - padding)
-        y1 = max(0, y - padding)
-        x2 = min(original_w, x + w + padding)
-        y2 = min(original_h, y + h + padding)
-        boxes.append((x1, y1, x2, y2))
-    merged = merge_overlapping_boxes(boxes)
-    return split_regions_into_lines(original, merged), prob
+    score_map = cv2.resize(score_map, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
+    boxes = boxes_from_prob_map(score_map, original, cutoff, unclip_ratio, min_area, padding, thresh_map=thresh_np)
+    return boxes, score_map

@@ -44,14 +44,18 @@ def box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float
     return inter / union if union else 0.0
 
 
-def detection_f1(
+def detection_counts(
     pred_boxes: list[tuple[int, int, int, int]],
     gt_boxes: list[tuple[int, int, int, int]],
     iou_threshold: float = 0.5,
-) -> dict[str, float]:
+) -> tuple[int, int, int]:
+    """(tp, fp, fn) under the ICDAR protocol: greedy one-to-one matching at IoU >= threshold.
+
+    Returning counts lets callers aggregate over a whole set (micro-average)
+    instead of averaging per-page F1, which over-weights near-empty pages.
+    """
     matched_gt: set[int] = set()
     tp = 0
-
     for pred in pred_boxes:
         best_iou, best_idx = 0.0, -1
         for idx, gt in enumerate(gt_boxes):
@@ -63,10 +67,36 @@ def detection_f1(
         if best_iou >= iou_threshold and best_idx >= 0:
             tp += 1
             matched_gt.add(best_idx)
+    return tp, len(pred_boxes) - tp, len(gt_boxes) - tp
 
-    fp = len(pred_boxes) - tp
-    fn = len(gt_boxes) - tp
+
+def prf_from_counts(tp: float, fp: float, fn: float) -> dict[str, float]:
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def detection_f1(
+    pred_boxes: list[tuple[int, int, int, int]],
+    gt_boxes: list[tuple[int, int, int, int]],
+    iou_threshold: float = 0.5,
+) -> dict[str, float]:
+    return prf_from_counts(*detection_counts(pred_boxes, gt_boxes, iou_threshold))
+
+
+def corpus_cer(predictions: list[str], targets: list[str]) -> float:
+    """Total character edits / total target characters - the form papers report.
+
+    Unlike the mean of per-line CERs, a 5-character line and a 60-character
+    line count in proportion to their length.
+    """
+    edits = sum(_edit_distance(p, t) for p, t in zip(predictions, targets))
+    chars = sum(len(t) for t in targets)
+    return edits / chars if chars else (0.0 if not any(predictions) else 1.0)
+
+
+def corpus_wer(predictions: list[str], targets: list[str]) -> float:
+    edits = sum(_edit_distance(p.split(), t.split()) for p, t in zip(predictions, targets))
+    words = sum(len(t.split()) for t in targets)
+    return edits / words if words else (0.0 if not any(p.split() for p in predictions) else 1.0)

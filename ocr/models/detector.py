@@ -10,8 +10,14 @@ from ocr.models.blocks import ConvBNAct, DepthwiseSeparableBlock
 class DBNet(nn.Module):
     """A compact DBNet-style text segmentation model.
 
-    It predicts a single text probability/logit map. The postprocessor in
-    ocr/inference/detection.py turns connected text regions into sorted line crops.
+    `forward` returns the text probability logit map, which is all inference
+    needs; the postprocessor in ocr/inference/detection.py turns it into sorted
+    line boxes. `forward_maps` additionally returns the threshold logit map used
+    by the differentiable-binarization loss during training.
+
+    The threshold head is a separate module so checkpoints from before it
+    existed still load (strict=False leaves it at its init); the probability
+    head keeps its original parameter names inside `fuse` for the same reason.
     """
 
     def __init__(self, in_channels: int = 1, inner_channels: int = 64) -> None:
@@ -29,11 +35,11 @@ class DBNet(nn.Module):
         self.fuse = nn.Sequential(
             ConvBNAct(inner_channels * 4, inner_channels, 3),
             DepthwiseSeparableBlock(inner_channels, inner_channels),
-            nn.Conv2d(inner_channels, 1, 1),
+            nn.Conv2d(inner_channels, 1, 1),  # probability head
         )
+        self.thresh_head = nn.Conv2d(inner_channels, 1, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_size = x.shape[-2:]
+    def _features(self, x: torch.Tensor) -> torch.Tensor:
         c1 = self.stem(x)
         c2 = self.stage2(c1)
         c3 = self.stage3(c2)
@@ -46,5 +52,18 @@ class DBNet(nn.Module):
             F.interpolate(self.lat3(c3), target, mode="bilinear", align_corners=False),
             F.interpolate(self.lat4(c4), target, mode="bilinear", align_corners=False),
         ]
-        logits = self.fuse(torch.cat(feats, dim=1))
+        fused = torch.cat(feats, dim=1)
+        return self.fuse[1](self.fuse[0](fused))  # everything up to the heads
+
+    def forward_maps(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(probability logits, threshold logits), both [B, 1, H, W] at input size."""
+        input_size = x.shape[-2:]
+        shared = self._features(x)
+        prob = F.interpolate(self.fuse[2](shared), input_size, mode="bilinear", align_corners=False)
+        thresh = F.interpolate(self.thresh_head(shared), input_size, mode="bilinear", align_corners=False)
+        return prob, thresh
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_size = x.shape[-2:]
+        logits = self.fuse[2](self._features(x))
         return F.interpolate(logits, input_size, mode="bilinear", align_corners=False)

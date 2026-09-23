@@ -4,7 +4,9 @@ torchvision>=0.15.0
 
 # Image processing
 Pillow>=9.0.0
-opencv-python>=4.7.0
+# headless: the GUI build drags in Qt and crashes on display-less machines (HPC
+# login nodes); <5 because the weeks-old 5.0 wheels also segfault on RHEL 8.
+opencv-python-headless>=4.7.0,<5
 
 # Numerical
 numpy>=1.23.0

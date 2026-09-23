@@ -1,13 +1,17 @@
-# What `sky launch` does NOT sync up as the working directory. Data is generated
-# on the GPU box; checkpoints and runs come back down with rsync afterwards.
-.git/
+# What `sky launch` / `remote/hpc.sh push` do NOT upload. Data is generated on
+# the GPU box; checkpoints and runs come back down with rsync afterwards.
+#
+# Top-level directories are anchored with a leading slash on purpose: an
+# unanchored `data/` would also match `ocr/data/`, which is source code.
+/.git/
+/data/
+/outputs/
+/checkpoints/
+/runs/
+/.venv/
+/venv/
+/myenv/
+/remote/hpc.env
 __pycache__/
 *.py[cod]
 .DS_Store
-data/
-outputs/
-checkpoints/
-runs/
-myenv/
-.venv/
-venv/

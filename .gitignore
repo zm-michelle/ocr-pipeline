@@ -24,3 +24,7 @@ config.toml
 *.pem
 *.key
 data/synthetic_docs/
+remote/hpc.env
+
+# derived from NoisyOffice via `python main.py --mode pseudo_label ...` (needs tesseract); regenerate, do not commit
+data/noisyoffice_labels/

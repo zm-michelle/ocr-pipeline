@@ -110,6 +110,8 @@ def health() -> JSONResponse:
             "detector": str(store.detector_ckpt) if store.detector_ckpt else None,
             "recognizer": str(store.recognizer_ckpt) if store.recognizer_ckpt else None,
             "has_detector": bool(pipeline and pipeline.has_detector),
+            "detector_info": pipeline.detector_info if pipeline else {},
+            "learned_threshold_default": bool(pipeline and pipeline.learned_threshold),
             "has_samples": bool(catalog.collections()),
         }
     )
@@ -180,11 +182,13 @@ async def ocr(
     use_detector: bool = Form(True),
     threshold: float = Form(0.35),
     split_lines: bool = Form(True),
+    learned_threshold: bool | None = Form(None),
 ) -> JSONResponse:
     pipeline = store.require()
 
     ground_truth: str | None = None
     related: list[dict[str, str]] = []
+    # To pull from the codebases own image samples
     if dataset and path:
         resolved = catalog.resolve(dataset, path)
         if resolved is None or not resolved.is_file():
@@ -223,6 +227,7 @@ async def ocr(
         use_detector=use_detector and pipeline.has_detector,
         threshold=max(0.01, min(0.99, threshold)),
         split_lines=split_lines,
+        learned_threshold=learned_threshold,
     )
     elapsed_ms = (time.perf_counter() - started) * 1000
 
@@ -236,6 +241,11 @@ async def ocr(
         "image": _png_data_uri(image),
         "used_line_split_fallback": result.used_line_split_fallback,
         "used_detector": use_detector and pipeline.has_detector,
+        "used_learned_threshold": bool(
+            use_detector and pipeline.has_detector
+            and (pipeline.learned_threshold if learned_threshold is None else learned_threshold)
+            and pipeline.detector_info.get("has_threshold_head")
+        ),
         "elapsed_ms": round(elapsed_ms, 1),
         "ground_truth": ground_truth,
         "related": related,

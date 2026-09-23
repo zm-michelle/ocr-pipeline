@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import functools
 import json
+import math
+import multiprocessing
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -9,15 +12,18 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from ocr.config import COMMON_FONT_DIRS, DEFAULT_PAGE_SIZE, FONT_FAMILIES, FONT_FILE_HINTS
+from ocr.config import COMMON_FONT_DIRS, DEFAULT_PAGE_SIZE, FONT_FAMILIES, FONT_FILE_BLOCKLIST, FONT_FILE_HINTS
 from ocr.data.transforms import (
     add_gaussian_noise,
     add_salt_pepper,
     add_smudge,
+    add_coffee_stain,
+    add_cup_ring,
     add_stain,
     add_uneven_illumination,
     mild_compression_artifacts,
 )
+from ocr.data.text_source import paragraph_words as _corpus_paragraph_words
 from ocr.utils import ProgressLogger
 
 
@@ -100,31 +106,88 @@ class FontResolver:
                 paths.extend(root.rglob("*.ttc"))
         return paths
 
-    def _find_path(self, family: str, bold: bool = False, italic: bool = False) -> Path | None:
+    @staticmethod
+    def _style_of(path: Path) -> tuple[bool, bool]:
+        """(bold, italic) read from the file name; URW uses Demi/BdIta, others Bold/Italic/Oblique."""
+        n = path.name.lower().replace("-", " ").replace("_", " ")
+        bold = any(t in n for t in ("bold", "demi", "bdita", "heavy", "black"))
+        italic = any(t in n for t in ("italic", "oblique", "bdita"))
+        return bold, italic
+
+    def candidates(self, family: str, bold: bool = False, italic: bool = False) -> list[Path]:
+        """Every installed face for `family` in the requested style, falling back to nearer styles.
+
+        Tiers are tried in order - exact style, then drop italic, then drop bold, then
+        regular - and the first non-empty tier is returned, so a request for bold
+        italic on a machine with no bold-italic faces still lands on something close.
+        """
         names = FONT_FAMILIES.get(family, FONT_FAMILIES["serif"])
-        preferred_styles: list[tuple[bool, bool]] = [(bold, italic)]
+        tiers: list[tuple[bool, bool]] = [(bold, italic)]
         if italic:
-            preferred_styles.append((False, True))
+            tiers.append((bold, False))
         if bold:
-            preferred_styles.append((True, False))
-        preferred_styles.append((False, False))
+            tiers.append((False, italic))
+        tiers.append((False, False))
+
+        matching: list[Path] = []
         for name in names:
-            hints = FONT_FILE_HINTS.get(name, [name.lower()])
-            for want_bold, want_italic in preferred_styles:
-                for path in self._font_paths:
-                    normalized = path.name.lower().replace("-", " ").replace("_", " ")
-                    if not any(hint.lower().replace("-", " ").replace("_", " ") in normalized for hint in hints):
-                        continue
-                    has_bold = "bold" in normalized
-                    has_italic = "italic" in normalized or "oblique" in normalized
-                    if want_bold and not has_bold:
-                        continue
-                    if want_italic and not has_italic:
-                        continue
-                    if not want_bold and bold and has_bold:
-                        continue
-                    return path
-        return None
+            hints = [h.lower().replace("-", " ").replace("_", " ") for h in FONT_FILE_HINTS.get(name, [name.lower()])]
+            for path in self._font_paths:
+                normalized = path.name.lower().replace("-", " ").replace("_", " ")
+                if any(b in normalized for b in FONT_FILE_BLOCKLIST):
+                    continue
+                if any(h in normalized for h in hints) and path not in matching:
+                    matching.append(path)
+
+        for want_bold, want_italic in tiers:
+            tier = [p for p in matching if self._style_of(p) == (want_bold, want_italic)]
+            if tier:
+                return tier
+        return []
+
+    def _find_path(self, family: str, bold: bool = False, italic: bool = False) -> Path | None:
+        found = self.candidates(family, bold, italic)
+        return found[0] if found else None
+
+    def pick(self, family: str, bold: bool = False, italic: bool = False) -> Path | None:
+        """One random face for this family and style. Uses `random`, so it follows the dataset seed."""
+        found = self.candidates(family, bold, italic)
+        return random.choice(found) if found else None
+
+    def load(self, path: Path | str | None, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        key = (str(path), size)
+        if key not in self._cache:
+            try:
+                self._cache[key] = ImageFont.truetype(str(path), size=size) if path else ImageFont.load_default()
+            except OSError:
+                self._cache[key] = ImageFont.load_default()
+        return self._cache[key]
+
+    def report(self) -> dict[str, list[Path]]:
+        """Regular-weight faces available per family (empty means the bitmap fallback)."""
+        return {family: self.candidates(family) for family in FONT_FAMILIES}
+
+    def require_real_fonts(self) -> None:
+        """Fail loudly instead of rendering a dataset with PIL's 8px bitmap font.
+
+        That fallback is silent, and a run of 20k pages drawn with it looks like
+        a dataset right up until the trained model reads nothing.
+        """
+        resolved = self.report()
+        missing = [family for family, paths in resolved.items() if not paths]
+        for family, paths in resolved.items():
+            if paths:
+                names = ", ".join(p.name for p in paths[:4]) + (", ..." if len(paths) > 4 else "")
+                print(f"font {family:10s} -> {len(paths)} face(s): {names}")
+            else:
+                print(f"font {family:10s} -> NOT FOUND (bitmap fallback)")
+        if missing:
+            searched = ", ".join(str(d) for d in COMMON_FONT_DIRS if d.exists()) or "(none of the font dirs exist)"
+            raise RuntimeError(
+                f"no TrueType font found for {missing}. Searched: {searched}. "
+                "Install DejaVu/Liberation (remote/fonts.sh does this without root) "
+                "or set OCR_FONT_DIRS to a directory of .ttf files."
+            )
 
     def get(
         self,
@@ -133,16 +196,8 @@ class FontResolver:
         bold: bool = False,
         italic: bool = False,
     ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-        key = (family, size, bold, italic)
-        if key in self._cache:
-            return self._cache[key]
-        path = self._find_path(family, bold=bold, italic=italic)
-        try:
-            font = ImageFont.truetype(str(path), size=size) if path else ImageFont.load_default()
-        except OSError:
-            font = ImageFont.load_default()
-        self._cache[key] = font
-        return font
+        """A random matching face at `size`. Prefer pick()+load() when the choice must be recorded."""
+        return self.load(self.pick(family, bold, italic), size)
 
 
 def _font_size_for_style(style: str) -> int:
@@ -175,10 +230,8 @@ def _random_line(max_words: int) -> str:
 
 
 def _paragraph_words() -> list[str]:
-    sentences = random.sample(PARAGRAPH_SENTENCES, k=random.randint(4, 7))
-    if random.random() < 0.35:
-        sentences.append(random.choice(PARAGRAPH_SENTENCES))
-    return " ".join(sentences).split()
+    """Real sentences with numbers/dates/codes spliced in (see ocr/data/text_source.py)."""
+    return _corpus_paragraph_words()
 
 
 def _wrap_words_to_lines(
@@ -244,7 +297,9 @@ def _add_fold_or_wrinkle(image: Image.Image, strength: float = 0.45) -> Image.Im
 def _apply_degradation(image: Image.Image, cfg: DegradationConfig) -> Image.Image:
     s = max(0.0, min(1.0, cfg.severity))
     out = image.convert("L")
-    out = _add_paper_texture(out, strength=0.35 + s * 0.45)
+    # Real scans (NoisyOffice) are white paper with heavy LOCAL damage; the old
+    # stack dimmed whole pages to gray. Keep the paper light and do the damage locally.
+    out = _add_paper_texture(out, strength=0.25 + s * 0.3)
     if random.random() < 0.40:
         out = _add_fold_or_wrinkle(out, strength=s)
     if cfg.faded_print and random.random() < 0.65:
@@ -252,14 +307,22 @@ def _apply_degradation(image: Image.Image, cfg: DegradationConfig) -> Image.Imag
         dark = arr < 180
         arr[dark] = arr[dark] * (1 - 0.25 * s) + 255 * (0.25 * s)
         out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-    if cfg.low_contrast and random.random() < 0.75:
+    if cfg.low_contrast and random.random() < 0.45:
         arr = np.asarray(out).astype(np.float32)
-        arr = 128 + (arr - 128) * random.uniform(0.55, 1.0)
+        # fade toward the paper, not toward mid-gray, so the page stays white
+        paper = float(np.percentile(arr, 90))
+        arr = paper + (arr - paper) * random.uniform(0.6, 1.0)
         out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
     if cfg.uneven_illumination and random.random() < 0.55:
         out = add_uneven_illumination(out, strength=0.18 * s)
-    if cfg.stains and random.random() < 0.45:
-        out = add_stain(out, opacity=random.uniform(0.08, 0.22) * s)
+    if cfg.stains:
+        r = random.random()
+        if r < 0.30:
+            out = add_coffee_stain(out, strength=s)  # heavy, over the text
+        elif r < 0.42:
+            out = add_cup_ring(out, strength=s)
+        elif r < 0.65:
+            out = add_stain(out, opacity=random.uniform(0.08, 0.22) * s)  # faint tint
     if cfg.smudges and random.random() < 0.35:
         out = add_smudge(out, strength=random.randint(3, 9))
     if cfg.blur and random.random() < 0.45:
@@ -348,11 +411,14 @@ def _draw_document(
 
     if render_profile == "noisyoffice":
         family = random.choices(["serif", "sans", "typewriter"], weights=[0.50, 0.30, 0.20])[0]
-        style = random.choices(["footnote", "normal", "large"], weights=[0.22, 0.68, 0.10])[0]
-        font_size = {"footnote": random.randint(14, 16), "normal": random.randint(17, 20), "large": random.randint(20, 23)}[style]
+        # NoisyOffice lines are ~20-36 px tall; the old 14-23 px range left the
+        # recognizer with no large-print experience, so weight "large" up and extend it.
+        style = random.choices(["footnote", "normal", "large"], weights=[0.18, 0.52, 0.30])[0]
+        font_size = {"footnote": random.randint(14, 16), "normal": random.randint(17, 22), "large": random.randint(23, 30)}[style]
         bold = random.random() < 0.18
         italic = family == "serif" and random.random() < 0.65
-        font = resolver.get(family, font_size, bold=bold, italic=italic)
+        font_file = resolver.pick(family, bold=bold, italic=italic)
+        font = resolver.load(font_file, font_size)
         target_min = max(8, min_lines)
         target_max = max(target_min, min(10, max_lines))
         n_lines = random.randint(target_min, target_max)
@@ -367,7 +433,8 @@ def _draw_document(
         font_size = _font_size_for_style(style)
         bold = random.random() < 0.22
         italic = False
-        font = resolver.get(family, font_size, bold=bold)
+        font_file = resolver.pick(family, bold=bold)
+        font = resolver.load(font_file, font_size)
         margin_x = random.randint(max(18, width // 28), max(24, width // 10))
         margin_top = random.randint(max(18, height // 32), max(32, height // 10))
         line_gap = random.randint(max(4, font_size // 4), max(8, font_size))
@@ -417,6 +484,7 @@ def _draw_document(
                 "text": visible_text,
                 "box": [bx1, by1, bx2, by2],
                 "font_family": family,
+                "font_file": str(font_file) if font_file else None,
                 "font_size": font_size,
                 "bold_like": bold,
                 "italic_like": italic,
@@ -427,12 +495,173 @@ def _draw_document(
     return image, lines
 
 
+MIN_LINE_W, MIN_LINE_H = 8, 4
+
+
+def _clip_lines(lines: list[dict], width: int, height: int) -> list[dict]:
+    """Clamp every box into the frame and drop lines left without a usable one.
+
+    Any page-level transform (skew, column offset) can push a line partly or
+    fully outside the page. Clamping one corner but not the other leaves an
+    inverted box such as [3, 260, 99, 258], which survives all the way to
+    PIL's crop and kills the run there; and a two-pixel sliver would keep the
+    full line text as its label, which is pure label noise.
+    """
+    kept: list[dict] = []
+    for line in lines:
+        x1, y1, x2, y2 = line["box"]
+        x1, x2 = min(max(0, x1), width), min(max(0, x2), width)
+        y1, y2 = min(max(0, y1), height), min(max(0, y2), height)
+        if x2 - x1 < MIN_LINE_W or y2 - y1 < MIN_LINE_H:
+            continue
+        line["box"] = [x1, y1, x2, y2]
+        kept.append(line)
+    return kept
+
+
+def _draw_two_columns(
+    page_size: tuple[int, int],
+    min_lines: int,
+    max_lines: int,
+    resolver: FontResolver,
+    render_profile: str,
+) -> tuple[Image.Image, list[dict]]:
+    """Two independently rendered columns side by side with a gutter.
+
+    Teaches the detector that lines can end mid-page and that two lines can
+    share a row, which a single paragraph never shows it.
+    """
+    width, height = page_size
+    gutter = random.randint(max(12, width // 30), max(20, width // 14))
+    col_w = (width - gutter) // 2
+    left, left_lines = _draw_document((col_w, height), min_lines, max_lines, resolver, render_profile)
+    right, right_lines = _draw_document((col_w, height), min_lines, max_lines, resolver, render_profile)
+    page = Image.new("L", (width, height), int(np.asarray(left)[0, 0]))
+    page.paste(left, (0, 0))
+    x_off = col_w + gutter
+    page.paste(right, (x_off, 0))
+    for line in right_lines:
+        x1, y1, x2, y2 = line["box"]
+        line["box"] = [x1 + x_off, y1, x2 + x_off, y2]
+    right_lines = _clip_lines(right_lines, width, height)
+    # reading order: row by row across both columns is not what OCR of two
+    # columns wants; keep column-major (all of left, then all of right)
+    return page, left_lines + right_lines
+
+
+def _skew_page(image: Image.Image, lines: list[dict], max_degrees: float = 1.5) -> tuple[Image.Image, list[dict]]:
+    """Rotate the whole page a little, as a slightly crooked scan would be; boxes follow."""
+    angle = random.uniform(-max_degrees, max_degrees)
+    width, height = image.size
+    background = int(np.asarray(image)[0, 0])
+    rotated = image.rotate(angle, resample=Image.BILINEAR, expand=False, fillcolor=background)
+    cx, cy = width / 2.0, height / 2.0
+    theta = math.radians(-angle)  # PIL rotates counter-clockwise for positive angles, image y points down
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    for line in lines:
+        x1, y1, x2, y2 = line["box"]
+        xs, ys = [], []
+        for px, py in ((x1, y1), (x2, y1), (x2, y2), (x1, y2)):
+            dx, dy = px - cx, py - cy
+            xs.append(cx + dx * cos_t - dy * sin_t)
+            ys.append(cy + dx * sin_t + dy * cos_t)
+        line["box"] = [int(min(xs)), int(min(ys)), int(math.ceil(max(xs))), int(math.ceil(max(ys)))]
+    return rotated, _clip_lines(lines, width, height)
+
+
 def _save_overlay(image: Image.Image, lines: list[dict], path: Path) -> None:
     overlay = image.convert("RGB")
     draw = ImageDraw.Draw(overlay)
     for line in lines:
         draw.rectangle(line["box"], outline=(220, 40, 40), width=2)
     overlay.save(path)
+
+
+_WORKER_RESOLVER: FontResolver | None = None
+
+
+def _worker_resolver() -> FontResolver:
+    """One FontResolver per process (the font scan is done once, then cached)."""
+    global _WORKER_RESOLVER
+    if _WORKER_RESOLVER is None:
+        _WORKER_RESOLVER = FontResolver()
+    return _WORKER_RESOLVER
+
+
+def _generate_page(
+    idx: int,
+    output_dir: str,
+    page_size: tuple[int, int],
+    min_lines: int,
+    max_lines: int,
+    make_line_crops: bool,
+    line_crop_truncation_prob: float,
+    page_crop_prob: float,
+    degradation: DegradationConfig,
+    preview: bool,
+    seed: int | None,
+    render_profile: str,
+) -> tuple[dict, list[dict]]:
+    """Render, degrade, and write one page plus its line crops; return manifest entries.
+
+    Seeded per page (seed + idx) so the dataset is identical whether it was made
+    by one process or eight, and any single page can be regenerated on its own.
+    """
+    if seed is not None:
+        random.seed(seed * 1_000_003 + idx)
+        np.random.seed((seed * 1_000_003 + idx) % (2**32))
+    out = Path(output_dir)
+    resolver = _worker_resolver()
+
+    if random.random() < 0.15:
+        clean, lines = _draw_two_columns(page_size, min_lines, max_lines, resolver, render_profile)
+    else:
+        clean, lines = _draw_document(page_size, min_lines, max_lines, resolver, render_profile)
+    if random.random() < 0.20:
+        clean, lines = _skew_page(clean, lines, 1.5)
+    clean, lines = _crop_page_edges(clean, lines, page_crop_prob, resolver)
+    degraded = _apply_degradation(clean, degradation)
+    lines = _clip_lines(lines, *clean.size)
+    page_name = f"page_{idx:06d}.png"
+    page_path = out / "pages" / page_name
+    degraded.save(page_path)
+    rel_page = str(page_path.relative_to(out))
+    page_entry = {"image": rel_page, "boxes": [l["box"] for l in lines], "lines": lines}
+
+    if preview:
+        _save_overlay(degraded, lines, out / "previews" / f"page_{idx:06d}_boxes.png")
+
+    line_entries: list[dict] = []
+    if make_line_crops:
+        for line_idx, line in enumerate(lines):
+            x1, y1, x2, y2 = line["box"]
+            if x2 - x1 < MIN_LINE_W or y2 - y1 < MIN_LINE_H:
+                continue  # belt and braces: one bad box must not kill a multi-hour job
+            crop = degraded.crop((x1, y1, x2, y2))
+            text = line["text"]
+            if random.random() < line_crop_truncation_prob and crop.width > 40:
+                cut_left = random.randint(0, max(1, int(crop.width * 0.20)))
+                cut_right = crop.width - random.randint(0, max(1, int(crop.width * 0.20)))
+                if cut_right - cut_left >= 20:
+                    # the exact face this line was drawn with, so the visible-substring
+                    # measurement matches the pixels (get() would pick a random face)
+                    font = resolver.load(line.get("font_file"), line["font_size"]) if line.get("font_file") else resolver.get(
+                        line["font_family"], line["font_size"], line["bold_like"], line.get("italic_like", False)
+                    )
+                    text = _visible_substring(text, font, cut_left, cut_right)
+                    crop = crop.crop((cut_left, 0, cut_right, crop.height))
+            if text:
+                crop_path = out / "line_crops" / f"page_{idx:06d}_line_{line_idx:02d}.png"
+                crop.save(crop_path)
+                line_entries.append(
+                    {"image": str(crop_path.relative_to(out)), "text": text, "source_page": rel_page, "box": line["box"]}
+                )
+    return page_entry, line_entries
+
+
+def _generate_page_star(job, args: tuple[int, bool]) -> tuple[dict, list[dict]]:
+    idx, preview = args
+    return job(idx, preview=preview)
 
 
 def generate_synthetic_dataset(
@@ -450,6 +679,7 @@ def generate_synthetic_dataset(
     log_every: int = 100,
     render_profile: str = "noisyoffice",
     val_split: float = 0.0,
+    workers: int = 1,
 ) -> dict[str, Path]:
     if not 0.0 <= val_split < 1.0:
         raise ValueError("val_split must be in [0, 1)")
@@ -465,62 +695,41 @@ def generate_synthetic_dataset(
     lines_dir.mkdir(parents=True, exist_ok=True)
     previews_dir.mkdir(parents=True, exist_ok=True)
 
-    resolver = FontResolver()
+    FontResolver().require_real_fonts()
     degradation = degradation or DegradationConfig()
     page_manifest: list[dict] = []
     line_manifest: list[dict] = []
     progress = ProgressLogger("synthetic generation", num_samples, log_every)
 
-    for idx in range(num_samples):
-        clean, lines = _draw_document(page_size, min_lines, max_lines, resolver, render_profile)
-        clean, lines = _crop_page_edges(clean, lines, page_crop_prob, resolver)
-        degraded = _apply_degradation(clean, degradation)
-        page_name = f"page_{idx:06d}.png"
-        page_path = pages_dir / page_name
-        degraded.save(page_path)
-
-        rel_page = str(page_path.relative_to(output_dir))
-        page_manifest.append({"image": rel_page, "boxes": [l["box"] for l in lines], "lines": lines})
-
-        if idx < preview_count:
-            _save_overlay(degraded, lines, previews_dir / f"page_{idx:06d}_boxes.png")
-
-        if make_line_crops:
-            for line_idx, line in enumerate(lines):
-                x1, y1, x2, y2 = line["box"]
-                crop = degraded.crop((x1, y1, x2, y2))
-                text = line["text"]
-                if random.random() < line_crop_truncation_prob and crop.width > 40:
-                    cut_left = random.randint(0, max(1, int(crop.width * 0.20)))
-                    cut_right = crop.width - random.randint(0, max(1, int(crop.width * 0.20)))
-                    if cut_right - cut_left >= 20:
-                        font = resolver.get(
-                            line["font_family"],
-                            line["font_size"],
-                            line["bold_like"],
-                            line.get("italic_like", False),
-                        )
-                        text = _visible_substring(text, font, cut_left, cut_right)
-                        crop = crop.crop((cut_left, 0, cut_right, crop.height))
-                if text:
-                    crop_name = f"page_{idx:06d}_line_{line_idx:02d}.png"
-                    crop_path = lines_dir / crop_name
-                    crop.save(crop_path)
-                    line_manifest.append(
-                        {
-                            "image": str(crop_path.relative_to(output_dir)),
-                            "text": text,
-                            "source_page": rel_page,
-                            "box": line["box"],
-                        }
-                    )
-        step = idx + 1
+    job = functools.partial(
+        _generate_page,
+        output_dir=str(output_dir),
+        page_size=page_size,
+        min_lines=min_lines,
+        max_lines=max_lines,
+        make_line_crops=make_line_crops,
+        line_crop_truncation_prob=line_crop_truncation_prob,
+        page_crop_prob=page_crop_prob,
+        degradation=degradation,
+        seed=seed,
+        render_profile=render_profile,
+    )
+    workers = max(1, int(workers))
+    if workers == 1:
+        results = (job(idx, preview=idx < preview_count) for idx in range(num_samples))
+    else:
+        pool = multiprocessing.get_context("spawn").Pool(workers)
+        results = pool.imap(functools.partial(_generate_page_star, job), [(idx, idx < preview_count) for idx in range(num_samples)], chunksize=8)
+    total_lines = 0
+    for step, (page_entry, line_entries) in enumerate(results, start=1):
+        page_manifest.append(page_entry)
+        line_manifest.extend(line_entries)
+        total_lines += len(page_entry["lines"])
         if progress.should_log(step):
-            avg_lines = sum(len(p["lines"]) for p in page_manifest) / step
-            progress.log(
-                step,
-                f"pages {step} line_crops {len(line_manifest)} avg_lines {avg_lines:.1f} loss n/a accuracy n/a",
-            )
+            progress.log(step, f"pages {step} line_crops {len(line_manifest)} avg_lines {total_lines / step:.1f} loss n/a accuracy n/a")
+    if workers > 1:
+        pool.close()
+        pool.join()
 
     pages_manifest_path = output_dir / "pages_manifest.json"
     lines_manifest_path = output_dir / "lines_manifest.json"
@@ -532,7 +741,9 @@ def generate_synthetic_dataset(
         "pages_manifest": pages_manifest_path,
         "lines_manifest": lines_manifest_path,
     }
-    num_val_pages = int(round(num_samples * val_split)) if val_split else 0
+    # A requested split always yields at least one held-out page (given two or
+    # more pages), so tiny smoke runs still produce the *_train/*_val manifests.
+    num_val_pages = max(1, int(round(num_samples * val_split))) if val_split and num_samples >= 2 else 0
     if num_val_pages:
         # Split by page, not by crop: every line crop of a validation page goes to
         # validation with it, so the recognizer never trains on text it is scored on.
